@@ -40,6 +40,7 @@ class MainActivity : AppCompatActivity() {
     private var selectedMediaItem: XMediaItem? = null
     private var selectedFormat: XFormatOption? = null
     private var currentUrl: String? = null
+    private var lastSavedFileUri: Uri? = null
 
     companion object {
         private const val PREFS_NAME = "x_downloader_prefs"
@@ -147,11 +148,35 @@ class MainActivity : AppCompatActivity() {
 
         // Action: Open Downloads / Gallery
         binding.btnViewVideo.setOnClickListener {
+            val uri = lastSavedFileUri
+            if (uri != null) {
+                try {
+                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(uri, "image/gif")
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    startActivity(intent)
+                    return@setOnClickListener
+                } catch (_: Exception) {}
+            }
             openDownloadsFolder()
         }
 
-        // Action: Share link
+        // Action: Share link or downloaded file
         binding.btnShare.setOnClickListener {
+            val uri = lastSavedFileUri
+            if (uri != null) {
+                try {
+                    val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                        type = "image/gif"
+                        putExtra(Intent.EXTRA_STREAM, uri)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    startActivity(Intent.createChooser(shareIntent, "Поделиться файлом GIF"))
+                    return@setOnClickListener
+                } catch (_: Exception) {}
+            }
+
             val url = currentUrl ?: return@setOnClickListener
             val post = currentPostInfo
             val shareIntent = Intent(Intent.ACTION_SEND).apply {
@@ -340,11 +365,12 @@ class MainActivity : AppCompatActivity() {
                 binding.progressDownload.visibility = View.GONE
 
                 if (uri != null) {
+                    lastSavedFileUri = uri
                     binding.tvStatus.text = "Готово! Анимация сохранена в «Загрузки»"
                     Toast.makeText(this@MainActivity, getString(R.string.toast_gif_saved), Toast.LENGTH_LONG).show()
                 } else {
                     binding.tvStatus.text = "Ошибка при создании GIF"
-                    Toast.makeText(this@MainActivity, "Ошибка при создании GIF", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this@MainActivity, "Ошибка при создании GIF. Попробуйте формат MP4.", Toast.LENGTH_LONG).show()
                 }
             }
         } else {

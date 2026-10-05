@@ -1,13 +1,8 @@
 package com.example.xdownloader.gif
 
 import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Paint
 import java.io.IOException
 import java.io.OutputStream
-import kotlin.math.abs
-import kotlin.math.max
-import kotlin.math.min
 
 /**
  * Pure Kotlin Animated GIF Encoder based on Kevin Weiner's GIF89a implementation.
@@ -31,6 +26,7 @@ class AnimatedGifEncoder {
     private var palSize: Int = 7
     private var dispose: Int = -1
     private var closeStream: Boolean = false
+    private var firstFrame: Boolean = true
     private var sample: Int = 10
 
     fun setDelay(ms: Int) {
@@ -58,6 +54,7 @@ class AnimatedGifEncoder {
         out = os
         closeStream = false
         started = true
+        firstFrame = true
         return try {
             writeString("GIF89a")
             true
@@ -73,7 +70,7 @@ class AnimatedGifEncoder {
             image = im
             getImagePixels()
             analyzeColors()
-            if (firstFrame()) {
+            if (firstFrame) {
                 writeLSD()
                 writePalette()
                 if (repeat >= 0) {
@@ -82,10 +79,11 @@ class AnimatedGifEncoder {
             }
             writeGraphicCtrlExt()
             writeImageDesc()
-            if (!firstFrame()) {
+            if (!firstFrame) {
                 writePalette()
             }
             writePixels()
+            firstFrame = false
         } catch (e: IOException) {
             ok = false
         }
@@ -111,12 +109,9 @@ class AnimatedGifEncoder {
         pixels = ByteArray(0)
         indexedPixels = ByteArray(0)
         colorTab = ByteArray(0)
+        firstFrame = true
         return ok
     }
-
-    private fun firstFrame(): Boolean = colorTab.isNotEmpty() && !hasWrittenFirstFrame
-
-    private var hasWrittenFirstFrame = false
 
     private fun analyzeColors() {
         val nPix = pixels.size / 3
@@ -124,7 +119,6 @@ class AnimatedGifEncoder {
         val nq = NeuQuant(pixels, pixels.size, sample)
         colorTab = nq.process()
 
-        // convert map from BGR to RGB and find closest colors
         var k = 0
         for (i in 0 until nPix) {
             val b = pixels[k++].toInt() and 0xff
@@ -153,9 +147,9 @@ class AnimatedGifEncoder {
         var count = 0
         for (i in rgb.indices) {
             val color = rgb[i]
-            pixels[count++] = ((color shr 16) and 0xff).toByte() // R
+            pixels[count++] = (color and 0xff).toByte()          // B
             pixels[count++] = ((color shr 8) and 0xff).toByte()  // G
-            pixels[count++] = (color and 0xff).toByte()         // B
+            pixels[count++] = ((color shr 16) and 0xff).toByte() // R
         }
     }
 
@@ -181,10 +175,10 @@ class AnimatedGifEncoder {
         writeShort(0)     // y position
         writeShort(width)
         writeShort(height)
-        if (hasWrittenFirstFrame) {
-            out!!.write(0x80 or 0x00 or 0 or palSize) // local color table
+        if (firstFrame) {
+            out!!.write(0) // no local color table on first frame, uses global
         } else {
-            out!!.write(0)
+            out!!.write(0x80 or 0x00 or 0 or palSize) // local color table
         }
     }
 
@@ -194,7 +188,6 @@ class AnimatedGifEncoder {
         out!!.write(0x80 or 0x70 or 0x00 or palSize) // global color table flag
         out!!.write(0) // background color index
         out!!.write(0) // pixel aspect ratio
-        hasWrittenFirstFrame = true
     }
 
     private fun writeNetscapeExt() {

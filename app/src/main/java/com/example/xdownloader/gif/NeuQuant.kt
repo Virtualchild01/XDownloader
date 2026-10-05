@@ -59,9 +59,10 @@ class NeuQuant(
         var k = 0
         for (i in 0 until netsize) {
             val j = index[i]
-            map[k++] = (network[j][0] shr netbiasshift).toByte()
-            map[k++] = (network[j][1] shr netbiasshift).toByte()
+            // Standard GIF palette is RGB: byte 0 = R, byte 1 = G, byte 2 = B
             map[k++] = (network[j][2] shr netbiasshift).toByte()
+            map[k++] = (network[j][1] shr netbiasshift).toByte()
+            map[k++] = (network[j][0] shr netbiasshift).toByte()
         }
         return map
     }

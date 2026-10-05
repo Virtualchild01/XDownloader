@@ -16,8 +16,9 @@ import java.util.concurrent.TimeUnit
 object DownloadUtil {
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(20, TimeUnit.SECONDS)
+        .connectTimeout(25, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
+        .followRedirects(true)
         .build()
 
     /**
@@ -41,6 +42,10 @@ object DownloadUtil {
             setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
             setAllowedOverMetered(true)
             setAllowedOverRoaming(true)
+            addRequestHeader(
+                "User-Agent",
+                "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+            )
         }
 
         val downloadManager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
@@ -64,10 +69,18 @@ object DownloadUtil {
                 onProgress(5)
             }
 
-            // Download MP4 to cache
-            val request = Request.Builder().url(videoUrl).build()
+            // Download MP4 to cache with realistic browser headers
+            val request = Request.Builder()
+                .url(videoUrl)
+                .header(
+                    "User-Agent",
+                    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+                )
+                .header("Accept", "*/*")
+                .build()
+
             httpClient.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) throw Exception("Ошибка загрузки видео: ${response.code}")
+                if (!response.isSuccessful) throw Exception("Ошибка загрузки видео (HTTP ${response.code})")
                 val body = response.body ?: throw Exception("Пустой ответ сервера")
                 val totalBytes = body.contentLength()
 
@@ -81,18 +94,23 @@ object DownloadUtil {
                             output.write(buffer, 0, bytesRead)
                             downloaded += bytesRead
                             if (totalBytes > 0) {
-                                val downloadPercent = (downloaded * 30 / totalBytes).toInt()
+                                val downloadPercent = (downloaded * 30 / totalBytes).toInt().coerceIn(5, 30)
                                 withContext(Dispatchers.Main) {
                                     onProgress(downloadPercent)
                                 }
                             }
                         }
+                        output.flush()
                     }
                 }
             }
 
+            if (!tempVideoFile.exists() || tempVideoFile.length() < 1000L) {
+                throw Exception("Скачанный видеофайл пуст или неполный (${tempVideoFile.length()} байт)")
+            }
+
             withContext(Dispatchers.Main) {
-                onStatusUpdate("Создание анимированного GIF...")
+                onStatusUpdate("Конвертация в анимацию GIF...")
                 onProgress(35)
             }
 
@@ -101,9 +119,9 @@ object DownloadUtil {
                 context = context,
                 videoFile = tempVideoFile,
                 targetTitle = "X_${sanitizeFilename(title)}",
-                maxDurationSec = 10,
-                fps = 8,
-                targetWidth = 400
+                maxDurationSec = 12,
+                fps = 10,
+                maxDimension = 360
             ) { gifPercent ->
                 // Progress from 35% to 100%
                 val totalProgress = 35 + (gifPercent * 65 / 100)
