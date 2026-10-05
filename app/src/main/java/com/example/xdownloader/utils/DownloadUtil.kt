@@ -1,15 +1,19 @@
 package com.example.xdownloader.utils
 
 import android.app.DownloadManager
+import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
+import android.provider.MediaStore
 import com.example.xdownloader.gif.GifConverter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.concurrent.TimeUnit
 
@@ -45,8 +49,9 @@ object DownloadUtil {
             setAllowedOverRoaming(true)
             addRequestHeader(
                 "User-Agent",
-                "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
+            addRequestHeader("Referer", "https://twitter.com/")
         }
 
         val downloadManager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
@@ -64,12 +69,11 @@ object DownloadUtil {
         onStatusUpdate: (String) -> Unit,
         onProgress: (Int) -> Unit
     ): Pair<Uri?, String?> = withContext(Dispatchers.IO) {
-        // Сохраняем в getExternalFilesDir, где у системного mediaserver есть доступ на чтение
         val baseDir = context.getExternalFilesDir(null) ?: context.cacheDir
         val tempVideoFile = File(baseDir, "temp_x_${System.currentTimeMillis()}.mp4")
         try {
             withContext(Dispatchers.Main) {
-                onStatusUpdate("Загрузка видеопотока...")
+                onStatusUpdate("Загрузка медиапотока...")
                 onProgress(5)
             }
 
@@ -77,8 +81,9 @@ object DownloadUtil {
                 .url(videoUrl)
                 .header(
                     "User-Agent",
-                    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
                 )
+                .header("Referer", "https://twitter.com/")
                 .header("Accept", "*/*")
                 .build()
 
@@ -125,11 +130,27 @@ object DownloadUtil {
                 return@withContext Pair(null, "Ошибка загрузки ($err)")
             }
 
+            // ПРОВЕРКА МАГИЧЕСКИХ БАЙТОВ: проверяем, что скачанный файл действительно медиа, а не HTML-заглушка провайдера
+            val headerBytes = ByteArray(12)
+            val readCount = FileInputStream(tempVideoFile).use { it.read(headerBytes) }
+            val isGif = readCount >= 3 && headerBytes[0] == 'G'.code.toByte() && headerBytes[1] == 'I'.code.toByte() && headerBytes[2] == 'F'.code.toByte()
+
+            // Если поток УЖЕ является GIF-файлом — сохраняем его напрямую без потерь!
+            if (isGif) {
+                val safeTitle = sanitizeFilename(title)
+                val directGifUri = saveRawGifToDownloads(context, tempVideoFile, "${safeTitle}_anim.gif")
+                withContext(Dispatchers.Main) {
+                    onProgress(100)
+                }
+                return@withContext Pair(directGifUri, if (directGifUri == null) "Не удалось сохранить GIF в хранилище" else null)
+            }
+
             withContext(Dispatchers.Main) {
                 onStatusUpdate("Конвертация в анимацию GIF...")
                 onProgress(35)
             }
 
+            // Конвертация MP4 видеопотока в GIF
             val (gifUri, gifErr) = GifConverter.convertVideoToGif(
                 context = context,
                 videoFile = tempVideoFile,
@@ -150,6 +171,39 @@ object DownloadUtil {
             if (tempVideoFile.exists()) {
                 tempVideoFile.delete()
             }
+        }
+    }
+
+    private fun saveRawGifToDownloads(context: Context, gifFile: File, fileName: String): Uri? {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "image/gif")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                }
+                val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                if (uri != null) {
+                    context.contentResolver.openOutputStream(uri)?.use { out ->
+                        FileInputStream(gifFile).use { input ->
+                            input.copyTo(out)
+                        }
+                    }
+                }
+                uri
+            } else {
+                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                if (!downloadsDir.exists()) downloadsDir.mkdirs()
+                val targetFile = File(downloadsDir, fileName)
+                FileInputStream(gifFile).use { input ->
+                    FileOutputStream(targetFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                Uri.fromFile(targetFile)
+            }
+        } catch (_: Exception) {
+            null
         }
     }
 
