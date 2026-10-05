@@ -157,7 +157,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     startActivity(intent)
                     return@setOnClickListener
-                } catch (ignored: Exception) {}
+                } catch (_: Exception) {}
             }
             openDownloadsFolder()
         }
@@ -174,7 +174,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     startActivity(Intent.createChooser(shareIntent, "Поделиться файлом GIF"))
                     return@setOnClickListener
-                } catch (ignored: Exception) {}
+                } catch (_: Exception) {}
             }
 
             val url = currentUrl ?: return@setOnClickListener

@@ -239,7 +239,7 @@ class NeuQuant(
                     p[0] -= (a * (p[0] - b)) / alpharadbias
                     p[1] -= (a * (p[1] - g)) / alpharadbias
                     p[2] -= (a * (p[2] - r)) / alpharadbias
-                } catch (ignored: Exception) {}
+                } catch (_: Exception) {}
             }
             if (k > lo) {
                 val p = network[k--]
@@ -247,7 +247,7 @@ class NeuQuant(
                     p[0] -= (a * (p[0] - b)) / alpharadbias
                     p[1] -= (a * (p[1] - g)) / alpharadbias
                     p[2] -= (a * (p[2] - r)) / alpharadbias
-                } catch (ignored: Exception) {}
+                } catch (_: Exception) {}
             }
         }
     }

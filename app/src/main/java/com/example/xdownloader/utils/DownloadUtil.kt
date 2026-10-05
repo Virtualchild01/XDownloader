@@ -202,7 +202,7 @@ object DownloadUtil {
                 }
                 Uri.fromFile(targetFile)
             }
-        } catch (ignored: Exception) {
+        } catch (_: Exception) {
             null
         }
     }

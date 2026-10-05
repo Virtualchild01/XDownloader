@@ -194,16 +194,19 @@ class XApiService {
                             )
                         }
 
-                        // ОБЯЗАТЕЛЬНО: Добавляем выбор формата GIF
-                        formats.add(
-                            XFormatOption(
-                                id = "gif_format",
-                                label = if (isNativeGif) "GIF (Оригинальная анимация .gif)" else "GIF (Конвертировать в анимацию .gif)",
-                                extension = "gif",
-                                downloadUrl = bestMp4Url,
-                                isGifConversion = true
-                            )
+                        // ОБЯЗАТЕЛЬНО: Добавляем выбор формата GIF (первым, если это GIF-пост)
+                        val gifOption = XFormatOption(
+                            id = "gif_format",
+                            label = if (isNativeGif) "GIF (Оригинальная анимация .gif)" else "GIF (Конвертировать в анимацию .gif)",
+                            extension = "gif",
+                            downloadUrl = bestMp4Url,
+                            isGifConversion = true
                         )
+                        if (isNativeGif) {
+                            formats.add(0, gifOption)
+                        } else {
+                            formats.add(gifOption)
+                        }
 
                         mediaList.add(
                             XMediaItem(
@@ -323,15 +326,18 @@ class XApiService {
                             }
 
                             if (bestUrl.isNotEmpty()) {
-                                formats.add(
-                                    XFormatOption(
-                                        id = "gif_format",
-                                        label = "GIF (Анимированный GIF)",
-                                        extension = "gif",
-                                        downloadUrl = bestUrl,
-                                        isGifConversion = true
-                                    )
+                                val gifOption = XFormatOption(
+                                    id = "gif_format",
+                                    label = "GIF (Анимированный GIF)",
+                                    extension = "gif",
+                                    downloadUrl = bestUrl,
+                                    isGifConversion = true
                                 )
+                                if (isGif) {
+                                    formats.add(0, gifOption)
+                                } else {
+                                    formats.add(gifOption)
+                                }
                             }
 
                             mediaList.add(
