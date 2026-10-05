@@ -39,7 +39,7 @@ object GifConverter {
         onProgress: (Int) -> Unit
     ): Pair<Uri?, String?> = withContext(Dispatchers.IO) {
         if (!videoFile.exists() || !videoFile.canRead() || videoFile.length() < 1000L) {
-            return@withContext Pair(null, "Видеофайл пуст или не прочитан (${videoFile.length()} байт)")
+            return@withContext Pair(null, "Видеофайл пуст или не прочитан (" + videoFile.length() + " байт)")
         }
 
         withContext(Dispatchers.Main) {
@@ -47,11 +47,11 @@ object GifConverter {
         }
 
         val safeTitle = targetTitle
-            .replace(Regex("[^a-zA-Z0-9а-яА-ЯёЁ._\-\s]"), "")
+            .filter { it.isLetterOrDigit() || it == '_' || it == '-' || it == '.' || it == ' ' }
             .trim()
             .take(45)
             .ifEmpty { "X_Post" }
-        val fileName = "${safeTitle}_anim.gif"
+        val fileName = safeTitle + "_anim.gif"
 
         var outputUri: Uri? = null
         var outStream: OutputStream? = null
@@ -106,7 +106,7 @@ object GifConverter {
                     }
                 }
             } catch (e: Throwable) {
-                lastDiag += "MediaCodec: ${e.message}; "
+                lastDiag = lastDiag + "MediaCodec: " + (e.message ?: "unknown") + "; "
             }
 
             // СТРАТЕГИЯ 2: Резервное извлечение через MediaMetadataRetriever с FileDescriptor
@@ -124,7 +124,7 @@ object GifConverter {
                         }
                     }
                 } catch (e: Throwable) {
-                    lastDiag += "Retriever: ${e.message}; "
+                    lastDiag = lastDiag + "Retriever: " + (e.message ?: "unknown") + "; "
                 }
             }
 
@@ -144,7 +144,7 @@ object GifConverter {
                         }
                     }
                 } catch (e: Throwable) {
-                    lastDiag += "Glide: ${e.message}; "
+                    lastDiag = lastDiag + "Glide: " + (e.message ?: "unknown") + "; "
                 }
             }
 
@@ -155,7 +155,7 @@ object GifConverter {
                 } else if (targetFile != null && targetFile.exists()) {
                     targetFile.delete()
                 }
-                val msg = if (lastDiag.isNotBlank()) "Не удалось извлечь кадры (${lastDiag.trim()})" else "Не удалось декодировать кадры из видеофайла"
+                val msg = if (lastDiag.isNotBlank()) "Не удалось извлечь кадры (" + lastDiag.trim() + ")" else "Не удалось декодировать кадры из видеофайла"
                 return@withContext Pair(null, msg)
             }
 
@@ -375,9 +375,9 @@ object GifConverter {
                     val uOff = uvRowIndex * uRowStride + uvColIndex * uPixelStride
                     val vOff = uvRowIndex * vRowStride + uvColIndex * vPixelStride
 
-                    val yVal = if (yOff >= 0 && yOff < yLimit) (yBuffer.get(yOff).toInt() and 0xFF) else 0
-                    val uVal = (if (uOff >= 0 && uOff < uLimit) (uBuffer.get(uOff).toInt() and 0xFF) else 128) - 128
-                    val vVal = (if (vOff >= 0 && vOff < vLimit) (vBuffer.get(vOff).toInt() and 0xFF) else 128) - 128
+                    val yVal = if (yOff in 0 until yLimit) (yBuffer.get(yOff).toInt() and 0xFF) else 0
+                    val uVal = (if (uOff in 0 until uLimit) (uBuffer.get(uOff).toInt() and 0xFF) else 128) - 128
+                    val vVal = (if (vOff in 0 until vLimit) (vBuffer.get(vOff).toInt() and 0xFF) else 128) - 128
 
                     var r = (yVal + 1.402f * vVal).toInt()
                     var g = (yVal - 0.344136f * uVal - 0.714136f * vVal).toInt()
