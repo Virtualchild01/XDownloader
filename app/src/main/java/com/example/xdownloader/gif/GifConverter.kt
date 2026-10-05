@@ -3,11 +3,6 @@ package com.example.xdownloader.gif
 import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
-import android.media.Image
-import android.media.MediaCodec
-import android.media.MediaCodecInfo
-import android.media.MediaExtractor
-import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
@@ -18,6 +13,12 @@ import com.bumptech.glide.Glide
 import com.bumptech.glide.request.RequestOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.jcodec.api.FrameGrab
+import org.jcodec.common.io.NIOUtils
+import org.jcodec.common.io.SeekableByteChannel
+import org.jcodec.common.model.ColorSpace
+import org.jcodec.common.model.Picture
+import org.jcodec.scale.ColorUtil
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -28,7 +29,7 @@ object GifConverter {
 
     /**
      * Converts a local MP4 video file into an animated GIF.
-     * Uses a multi-tiered decoding architecture to guarantee success across all Android OEMs (Xiaomi, Samsung, Pixel, etc.).
+     * Uses pure Java H.264 decoding (JCodec) as Tier 1 to bypass all OEM / Xiaomi / mediaserver restrictions.
      * @return Pair of (Uri?, errorMessage?)
      */
     suspend fun convertVideoToGif(
@@ -97,26 +98,47 @@ object GifConverter {
             val totalTargetFrames = maxDurationSec * fps
             val diagLog = StringBuilder()
 
-            // УРОВЕНЬ 1 (Основной): Универсальный MediaMetadataRetriever через ParcelFileDescriptor / абсолютный путь
+            // УРОВЕНЬ 1 (Основной): 100% чистый Java декодер JCodec.
+            // Работает прямо в процессе приложения, не зависит от mediaserver, драйверов Qualcomm/MediaTek и Surface.
             try {
-                framesAdded = extractWithRetriever(
-                    context = context,
+                framesAdded = extractWithJCodec(
                     videoFile = videoFile,
-                    maxDurationSec = maxDurationSec,
-                    fps = fps,
-                    maxDimension = maxDimension,
-                    encoder = encoder,
-                    diagLog = diagLog
-                ) { p ->
+                    maxFrames = totalTargetFrames,
+                    frameStep = 1,
+                    targetWidth = maxDimension
+                ) { bitmap ->
+                    encoder.addFrame(bitmap)
+                    val p = (35 + ((framesAdded + 1) * 60 / totalTargetFrames)).coerceAtMost(95)
                     kotlinx.coroutines.runBlocking(Dispatchers.Main) {
                         onProgress(p)
                     }
                 }
             } catch (e: Throwable) {
-                diagLog.append("RetrieverEx: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+                diagLog.append("JCodec: ").append(e.message ?: e.javaClass.simpleName).append("; ")
             }
 
-            // УРОВЕНЬ 2: Извлечение через Glide Video Frame Loader (RequestOptions.frameOf)
+            // УРОВЕНЬ 2 (Резервный): MediaMetadataRetriever через PFD / дескриптор
+            if (framesAdded == 0) {
+                try {
+                    framesAdded = extractWithRetriever(
+                        context = context,
+                        videoFile = videoFile,
+                        maxDurationSec = maxDurationSec,
+                        fps = fps,
+                        maxDimension = maxDimension,
+                        encoder = encoder,
+                        diagLog = diagLog
+                    ) { p ->
+                        kotlinx.coroutines.runBlocking(Dispatchers.Main) {
+                            onProgress(p)
+                        }
+                    }
+                } catch (e: Throwable) {
+                    diagLog.append("MMR: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+                }
+            }
+
+            // УРОВЕНЬ 3 (Резервный): Glide Video Frame Loader
             if (framesAdded == 0) {
                 try {
                     framesAdded = extractWithGlide(
@@ -132,27 +154,7 @@ object GifConverter {
                         }
                     }
                 } catch (e: Throwable) {
-                    diagLog.append("GlideEx: ").append(e.message ?: e.javaClass.simpleName).append("; ")
-                }
-            }
-
-            // УРОВЕНЬ 3: MediaCodec программное декодирование на CPU
-            if (framesAdded == 0) {
-                try {
-                    framesAdded = extractWithSoftwareMediaCodec(
-                        videoFile = videoFile,
-                        maxFrames = totalTargetFrames,
-                        frameStep = 1,
-                        targetWidth = maxDimension
-                    ) { bitmap ->
-                        encoder.addFrame(bitmap)
-                        val p = (35 + ((framesAdded + 1) * 60 / totalTargetFrames)).coerceAtMost(95)
-                        kotlinx.coroutines.runBlocking(Dispatchers.Main) {
-                            onProgress(p)
-                        }
-                    }
-                } catch (e: Throwable) {
-                    diagLog.append("CodecEx: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+                    diagLog.append("Glide: ").append(e.message ?: e.javaClass.simpleName).append("; ")
                 }
             }
 
@@ -164,9 +166,9 @@ object GifConverter {
                     targetFile.delete()
                 }
                 val msg = if (diagLog.isNotBlank()) {
-                    "Сбой извлечения кадров (" + diagLog.toString().trim() + ", размер: " + videoFile.length() + " Б)"
+                    "Сбой декодирования (" + diagLog.toString().trim() + ", размер: " + videoFile.length() + " Б)"
                 } else {
-                    "Не удалось декодировать кадры (размер файла: " + videoFile.length() + " Б)"
+                    "Не удалось извлечь кадры из видеофайла (размер: " + videoFile.length() + " Б)"
                 }
                 return@withContext Pair(null, msg)
             }
@@ -200,8 +202,88 @@ object GifConverter {
     }
 
     /**
-     * Надежное извлечение кадров через MediaMetadataRetriever.
-     * Пробует поочередно ParcelFileDescriptor, абсолютный путь, открытый FileInputStream и Uri.
+     * Декодирование видео через чистый Java движок JCodec.
+     * Не использует mediaserver, MediaCodec, Surface или нативные библиотеки C++.
+     */
+    private fun extractWithJCodec(
+        videoFile: File,
+        maxFrames: Int,
+        frameStep: Int,
+        targetWidth: Int,
+        onFrame: (Bitmap) -> Unit
+    ): Int {
+        var added = 0
+        var channel: SeekableByteChannel? = null
+        try {
+            channel = NIOUtils.readableChannel(videoFile)
+            val grab = FrameGrab.createFrameGrab(channel)
+
+            var frameCount = 0
+            while (added < maxFrames) {
+                val pic: Picture = grab.nativeFrame ?: break
+
+                if (frameCount % frameStep == 0) {
+                    val bitmap = jcodecPictureToBitmap(pic)
+                    if (bitmap != null) {
+                        val scaled = if (bitmap.width != targetWidth && targetWidth > 0) {
+                            val aspect = bitmap.height.toFloat() / bitmap.width.toFloat()
+                            val targetHeight = ((targetWidth * aspect).toInt() / 2) * 2
+                            Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight.coerceAtLeast(2), true)
+                        } else bitmap
+
+                        onFrame(scaled)
+                        added++
+                    }
+                }
+                frameCount++
+            }
+        } finally {
+            try { NIOUtils.closeQuietly(channel) } catch (ignored: Throwable) {}
+        }
+        return added
+    }
+
+    /**
+     * Конвертация Picture (YUV) из JCodec в стандартный Android ARGB_8888 Bitmap.
+     */
+    private fun jcodecPictureToBitmap(src: Picture): Bitmap? {
+        return try {
+            val rgbPic: Picture
+            if (src.color == ColorSpace.RGB) {
+                rgbPic = src
+            } else {
+                val transform = ColorUtil.getTransform(src.color, ColorSpace.RGB)
+                rgbPic = Picture.create(src.width, src.height, ColorSpace.RGB)
+                transform.transform(src, rgbPic)
+            }
+
+            val w = rgbPic.width
+            val h = rgbPic.height
+            val bytes = rgbPic.data[0]
+            val pixels = IntArray(w * h)
+            var bi = 0
+            val limit = bytes.size
+
+            for (i in 0 until (w * h)) {
+                if (bi + 2 < limit) {
+                    val r = bytes[bi++].toInt() and 0xFF
+                    val g = bytes[bi++].toInt() and 0xFF
+                    val b = bytes[bi++].toInt() and 0xFF
+                    pixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                } else {
+                    pixels[i] = -0x1000000
+                }
+            }
+
+            Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
+        } catch (e: Throwable) {
+            e.printStackTrace()
+            null
+        }
+    }
+
+    /**
+     * Извлечение кадров через MediaMetadataRetriever (универсальный перебор).
      */
     private fun extractWithRetriever(
         context: Context,
@@ -221,7 +303,7 @@ object GifConverter {
         try {
             var initialized = false
 
-            // Попытка 1: через ParcelFileDescriptor (официальный способ IPC на Android 10-15)
+            // Попытка 1: ParcelFileDescriptor
             try {
                 val testRetriever = MediaMetadataRetriever()
                 pfd = ParcelFileDescriptor.open(videoFile, ParcelFileDescriptor.MODE_READ_ONLY)
@@ -232,7 +314,7 @@ object GifConverter {
                 diagLog.append("PfdInit: ").append(e.message ?: e.javaClass.simpleName).append("; ")
             }
 
-            // Попытка 2: через абсолютный путь (работает в Downloads и общедоступных папках)
+            // Попытка 2: абсолютный путь
             if (!initialized) {
                 try {
                     val testRetriever = MediaMetadataRetriever()
@@ -244,7 +326,7 @@ object GifConverter {
                 }
             }
 
-            // Попытка 3: через FileInputStream FD
+            // Попытка 3: FileInputStream FD
             if (!initialized) {
                 try {
                     val testRetriever = MediaMetadataRetriever()
@@ -257,7 +339,7 @@ object GifConverter {
                 }
             }
 
-            // Попытка 4: через Context и Uri
+            // Попытка 4: Context + Uri
             if (!initialized) {
                 try {
                     val testRetriever = MediaMetadataRetriever()
@@ -284,19 +366,16 @@ object GifConverter {
                 val timeUs = i * frameIntervalMs * 1000L
                 var frame: Bitmap? = null
 
-                // Способ A: getFrameAtTime с OPTION_CLOSEST_SYNC (гарантированно декодирует ключевой кадр)
                 try {
                     frame = mmr.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                 } catch (ignored: Throwable) {}
 
-                // Способ B: getFrameAtTime с OPTION_CLOSEST
                 if (frame == null) {
                     try {
                         frame = mmr.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
                     } catch (ignored: Throwable) {}
                 }
 
-                // Способ C: getScaledFrameAtTime (API 27+)
                 if (frame == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 && maxDimension > 0) {
                     try {
                         val videoWidth = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: maxDimension
@@ -307,14 +386,12 @@ object GifConverter {
                     } catch (ignored: Throwable) {}
                 }
 
-                // Способ D: OPTION_PREVIOUS_SYNC
                 if (frame == null) {
                     try {
                         frame = mmr.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_PREVIOUS_SYNC)
                     } catch (ignored: Throwable) {}
                 }
 
-                // Способ E: базовый frameAtTime
                 if (frame == null && i == 0) {
                     try {
                         frame = mmr.frameAtTime
@@ -421,205 +498,5 @@ object GifConverter {
             e.printStackTrace()
         }
         return added
-    }
-
-    /**
-     * Программное декодирование через MediaExtractor + MediaCodec с правильным циклом ожидания кадров.
-     */
-    private fun extractWithSoftwareMediaCodec(
-        videoFile: File,
-        maxFrames: Int,
-        frameStep: Int,
-        targetWidth: Int,
-        onFrame: (Bitmap) -> Unit
-    ): Int {
-        val extractor = MediaExtractor()
-        var fis: FileInputStream? = null
-        var codec: MediaCodec? = null
-        var decodedCount = 0
-        var acceptedCount = 0
-
-        try {
-            fis = FileInputStream(videoFile)
-            extractor.setDataSource(fis.fd, 0L, videoFile.length())
-
-            var videoTrack = -1
-            var format: MediaFormat? = null
-
-            for (i in 0 until extractor.trackCount) {
-                val f = extractor.getTrackFormat(i)
-                val mime = f.getString(MediaFormat.KEY_MIME) ?: ""
-                if (mime.startsWith("video/")) {
-                    videoTrack = i
-                    format = f
-                    break
-                }
-            }
-
-            if (videoTrack < 0 || format == null) return 0
-            extractor.selectTrack(videoTrack)
-
-            val mime = format.getString(MediaFormat.KEY_MIME) ?: "video/avc"
-
-            format.setInteger(
-                MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
-            )
-
-            val candidates = listOf("c2.android.avc.decoder", "OMX.google.h264.decoder", null)
-            var activeDecoder: MediaCodec? = null
-
-            for (name in candidates) {
-                try {
-                    val dec = if (name != null) {
-                        MediaCodec.createByCodecName(name)
-                    } else {
-                        MediaCodec.createDecoderByType(mime)
-                    }
-                    dec.configure(format, null, null, 0)
-                    dec.start()
-                    activeDecoder = dec
-                    break
-                } catch (ignored: Throwable) {}
-            }
-
-            val decoder = activeDecoder ?: return 0
-            codec = decoder
-
-            val info = MediaCodec.BufferInfo()
-            var sawInputEOS = false
-            var sawOutputEOS = false
-            var noOutputCounter = 0
-            val timeoutUs = 10000L
-
-            while (!sawOutputEOS && acceptedCount < maxFrames && noOutputCounter < 150) {
-                if (!sawInputEOS) {
-                    val inputIndex = decoder.dequeueInputBuffer(timeoutUs)
-                    if (inputIndex >= 0) {
-                        val inputBuffer = decoder.getInputBuffer(inputIndex)
-                        if (inputBuffer != null) {
-                            val sampleSize = extractor.readSampleData(inputBuffer, 0)
-                            if (sampleSize < 0) {
-                                decoder.queueInputBuffer(inputIndex, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                                sawInputEOS = true
-                            } else {
-                                val timeUs = extractor.sampleTime
-                                decoder.queueInputBuffer(inputIndex, 0, sampleSize, timeUs, 0)
-                                extractor.advance()
-                            }
-                        }
-                    }
-                }
-
-                val outputIndex = decoder.dequeueOutputBuffer(info, timeoutUs)
-                if (outputIndex >= 0) {
-                    noOutputCounter = 0
-
-                    if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                        sawOutputEOS = true
-                    }
-
-                    if (info.size > 0) {
-                        val image = try { decoder.getOutputImage(outputIndex) } catch (ignored: Throwable) { null }
-                        if (image != null) {
-                            if (decodedCount % frameStep == 0) {
-                                val bitmap = yuvImageToBitmap(image)
-                                if (bitmap != null) {
-                                    val scaled = if (bitmap.width != targetWidth && targetWidth > 0) {
-                                        val aspect = bitmap.height.toFloat() / bitmap.width.toFloat()
-                                        val targetHeight = ((targetWidth * aspect).toInt() / 2) * 2
-                                        Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight.coerceAtLeast(2), true)
-                                    } else bitmap
-
-                                    onFrame(scaled)
-                                    acceptedCount++
-                                }
-                            }
-                            try { image.close() } catch (ignored: Throwable) {}
-                            decodedCount++
-                        }
-                    }
-                    decoder.releaseOutputBuffer(outputIndex, false)
-                } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED || outputIndex == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) {
-                    noOutputCounter = 0
-                } else {
-                    if (sawInputEOS) {
-                        noOutputCounter++
-                    }
-                }
-            }
-        } finally {
-            try { codec?.stop() } catch (ignored: Throwable) {}
-            try { codec?.release() } catch (ignored: Throwable) {}
-            try { extractor.release() } catch (ignored: Throwable) {}
-            try { fis?.close() } catch (ignored: Throwable) {}
-        }
-
-        return acceptedCount
-    }
-
-    /**
-     * Конвертация YUV_420_888 в RGB Bitmap (ITU-R BT.601) с защитой от выхода за границы буферов.
-     */
-    private fun yuvImageToBitmap(image: Image): Bitmap? {
-        return try {
-            val crop = image.cropRect
-            val width = crop.width()
-            val height = crop.height()
-
-            val yPlane = image.planes[0]
-            val uPlane = image.planes[1]
-            val vPlane = image.planes[2]
-
-            val yBuffer = yPlane.buffer
-            val uBuffer = uPlane.buffer
-            val vBuffer = vPlane.buffer
-
-            val yRowStride = yPlane.rowStride
-            val yPixelStride = yPlane.pixelStride
-            val uRowStride = uPlane.rowStride
-            val uPixelStride = uPlane.pixelStride
-            val vRowStride = vPlane.rowStride
-            val vPixelStride = vPlane.pixelStride
-
-            val yLimit = yBuffer.limit()
-            val uLimit = uBuffer.limit()
-            val vLimit = vBuffer.limit()
-
-            val pixels = IntArray(width * height)
-            var pixelIdx = 0
-
-            for (y in 0 until height) {
-                val yRowOffset = (y + crop.top) * yRowStride
-                val uvRowIndex = (y + crop.top) shr 1
-
-                for (x in 0 until width) {
-                    val yOff = yRowOffset + (x + crop.left) * yPixelStride
-                    val uvColIndex = (x + crop.left) shr 1
-
-                    val uOff = uvRowIndex * uRowStride + uvColIndex * uPixelStride
-                    val vOff = uvRowIndex * vRowStride + uvColIndex * vPixelStride
-
-                    val yVal = if (yOff in 0 until yLimit) (yBuffer.get(yOff).toInt() and 0xFF) else 0
-                    val uVal = (if (uOff in 0 until uLimit) (uBuffer.get(uOff).toInt() and 0xFF) else 128) - 128
-                    val vVal = (if (vOff in 0 until vLimit) (vBuffer.get(vOff).toInt() and 0xFF) else 128) - 128
-
-                    var r = (yVal + 1.402f * vVal).toInt()
-                    var g = (yVal - 0.344136f * uVal - 0.714136f * vVal).toInt()
-                    var b = (yVal + 1.772f * uVal).toInt()
-
-                    if (r < 0) r = 0 else if (r > 255) r = 255
-                    if (g < 0) g = 0 else if (g > 255) g = 255
-                    if (b < 0) b = 0 else if (b > 255) b = 255
-
-                    pixels[pixelIdx++] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-                }
-            }
-
-            Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
-        } catch (e: Throwable) {
-            e.printStackTrace()
-            null
-        }
     }
 }

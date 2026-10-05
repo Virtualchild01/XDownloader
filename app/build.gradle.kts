@@ -77,4 +77,7 @@ dependencies {
 
     // Image loading for thumbnails and photos
     implementation("com.github.bumptech.glide:glide:4.16.0")
+
+    // Pure Java H.264 / MP4 frame extractor (100% device & OEM independent)
+    implementation("org.jcodec:jcodec:0.2.5")
 }
