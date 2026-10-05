@@ -29,7 +29,7 @@ object GifConverter {
 
     /**
      * Converts a local MP4 video file into an animated GIF.
-     * Uses pure Java H.264 decoding (JCodec) as Tier 1 to bypass all OEM / Xiaomi / mediaserver restrictions.
+     * Uses pure Java H.264 decoding (JCodec) with correct color restoration and smooth playback delay.
      * @return Pair of (Uri?, errorMessage?)
      */
     suspend fun convertVideoToGif(
@@ -37,7 +37,7 @@ object GifConverter {
         videoFile: File,
         targetTitle: String,
         maxDurationSec: Int = 10,
-        fps: Int = 10,
+        fps: Int = 15,
         maxDimension: Int = 320,
         onProgress: (Int) -> Unit
     ): Pair<Uri?, String?> = withContext(Dispatchers.IO) {
@@ -104,15 +104,10 @@ object GifConverter {
                 framesAdded = extractWithJCodec(
                     videoFile = videoFile,
                     maxFrames = totalTargetFrames,
-                    frameStep = 1,
-                    targetWidth = maxDimension
-                ) { bitmap ->
-                    encoder.addFrame(bitmap)
-                    val p = (35 + ((framesAdded + 1) * 60 / totalTargetFrames)).coerceAtMost(95)
-                    kotlinx.coroutines.runBlocking(Dispatchers.Main) {
-                        onProgress(p)
-                    }
-                }
+                    targetWidth = maxDimension,
+                    encoder = encoder,
+                    onProgress = onProgress
+                )
             } catch (e: Throwable) {
                 diagLog.append("JCodec: ").append(e.message ?: e.javaClass.simpleName).append("; ")
             }
@@ -208,43 +203,67 @@ object GifConverter {
     private fun extractWithJCodec(
         videoFile: File,
         maxFrames: Int,
-        frameStep: Int,
         targetWidth: Int,
-        onFrame: (Bitmap) -> Unit
+        encoder: AnimatedGifEncoder,
+        onProgress: (Int) -> Unit
     ): Int {
-        var added = 0
         var channel: SeekableByteChannel? = null
+        val decodedBitmaps = mutableListOf<Bitmap>()
+
         try {
             channel = NIOUtils.readableChannel(videoFile)
             val grab = FrameGrab.createFrameGrab(channel)
 
-            var frameCount = 0
-            while (added < maxFrames) {
+            var readCount = 0
+            while (readCount < maxFrames) {
                 val pic: Picture = grab.nativeFrame ?: break
 
-                if (frameCount % frameStep == 0) {
-                    val bitmap = jcodecPictureToBitmap(pic)
-                    if (bitmap != null) {
-                        val scaled = if (bitmap.width != targetWidth && targetWidth > 0) {
-                            val aspect = bitmap.height.toFloat() / bitmap.width.toFloat()
-                            val targetHeight = ((targetWidth * aspect).toInt() / 2) * 2
-                            Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight.coerceAtLeast(2), true)
-                        } else bitmap
+                val bitmap = jcodecPictureToBitmap(pic)
+                if (bitmap != null) {
+                    val scaled = if (bitmap.width != targetWidth && targetWidth > 0) {
+                        val aspect = bitmap.height.toFloat() / bitmap.width.toFloat()
+                        val targetHeight = ((targetWidth * aspect).toInt() / 2) * 2
+                        val s = Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight.coerceAtLeast(2), true)
+                        if (s != bitmap) bitmap.recycle()
+                        s
+                    } else bitmap
 
-                        onFrame(scaled)
-                        added++
-                    }
+                    decodedBitmaps.add(scaled)
                 }
-                frameCount++
+                readCount++
+            }
+
+            if (decodedBitmaps.isEmpty()) return 0
+
+            val totalFrames = decodedBitmaps.size
+            // Рассчитываем задержку на кадр: для 20-30 кадров около 50-66 мс (~15-20 кадров/сек)
+            val estimatedDurationMs = (totalFrames * 45).coerceIn(600, 5000)
+            val delayPerFrameMs = (estimatedDurationMs / totalFrames).coerceIn(40, 100)
+
+            encoder.setDelay(delayPerFrameMs)
+            encoder.setRepeat(0) // Бесконечный цикл
+
+            for ((index, bmp) in decodedBitmaps.withIndex()) {
+                encoder.addFrame(bmp)
+                bmp.recycle()
+
+                val p = 35 + ((index + 1) * 60 / totalFrames)
+                kotlinx.coroutines.runBlocking(Dispatchers.Main) {
+                    onProgress(p)
+                }
             }
         } finally {
             try { NIOUtils.closeQuietly(channel) } catch (ignored: Throwable) {}
+            for (b in decodedBitmaps) {
+                if (!b.isRecycled) b.recycle()
+            }
         }
-        return added
+        return decodedBitmaps.size
     }
 
     /**
-     * Конвертация Picture (YUV) из JCodec в стандартный Android ARGB_8888 Bitmap.
+     * Конвертация Picture (YUV) из JCodec в стандартный Android ARGB_8888 Bitmap
+     * с правильным преобразованием знакового диапазона байтов [-128..127] в [0..255].
      */
     private fun jcodecPictureToBitmap(src: Picture): Bitmap? {
         return try {
@@ -266,9 +285,10 @@ object GifConverter {
 
             for (i in 0 until (w * h)) {
                 if (bi + 2 < limit) {
-                    val r = bytes[bi++].toInt() and 0xFF
-                    val g = bytes[bi++].toInt() and 0xFF
-                    val b = bytes[bi++].toInt() and 0xFF
+                    // Знаковые байты JCodec [-128..127] смещаются на +128 в диапазон [0..255]
+                    val r = (bytes[bi++].toInt() + 128).coerceIn(0, 255)
+                    val g = (bytes[bi++].toInt() + 128).coerceIn(0, 255)
+                    val b = (bytes[bi++].toInt() + 128).coerceIn(0, 255)
                     pixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
                 } else {
                     pixels[i] = -0x1000000
