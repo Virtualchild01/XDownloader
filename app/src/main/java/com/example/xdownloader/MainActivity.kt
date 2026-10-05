@@ -152,7 +152,7 @@ class MainActivity : AppCompatActivity() {
             if (uri != null) {
                 try {
                     val intent = Intent(Intent.ACTION_VIEW).apply {
-                        setDataAndType(uri, "image/gif")
+                        setDataAndType(uri, "*/*")
                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     }
                     startActivity(intent)
@@ -168,11 +168,11 @@ class MainActivity : AppCompatActivity() {
             if (uri != null) {
                 try {
                     val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                        type = "image/gif"
+                        type = "*/*"
                         putExtra(Intent.EXTRA_STREAM, uri)
                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     }
-                    startActivity(Intent.createChooser(shareIntent, "Поделиться файлом GIF"))
+                    startActivity(Intent.createChooser(shareIntent, "Поделиться файлом"))
                     return@setOnClickListener
                 } catch (_: Exception) {}
             }
@@ -366,8 +366,13 @@ class MainActivity : AppCompatActivity() {
 
                 if (uri != null) {
                     lastSavedFileUri = uri
-                    binding.tvStatus.text = "Готово! Анимация сохранена в «Загрузки»"
-                    Toast.makeText(this@MainActivity, getString(R.string.toast_gif_saved), Toast.LENGTH_LONG).show()
+                    if (errorMsg == "SAVED_AS_MP4") {
+                        binding.tvStatus.text = "Анимация сохранена в «Загрузки» в формате MP4"
+                        Toast.makeText(this@MainActivity, "Анимация сохранена в «Загрузки» как MP4", Toast.LENGTH_LONG).show()
+                    } else {
+                        binding.tvStatus.text = "Готово! Анимация сохранена в «Загрузки»"
+                        Toast.makeText(this@MainActivity, getString(R.string.toast_gif_saved), Toast.LENGTH_LONG).show()
+                    }
                 } else {
                     val err = errorMsg ?: "Не удалось обработать поток"
                     binding.tvStatus.text = "Ошибка: $err"
