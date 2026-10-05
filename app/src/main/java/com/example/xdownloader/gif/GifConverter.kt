@@ -26,7 +26,7 @@ object GifConverter {
 
     /**
      * Converts a local MP4 video file into an animated GIF.
-     * Uses Android's low-level hardware/software MediaCodec decoder directly.
+     * Uses Android low-level hardware/software MediaCodec decoder directly.
      * @return Pair of (Uri?, errorMessage?)
      */
     suspend fun convertVideoToGif(
@@ -414,8 +414,12 @@ object GifConverter {
         var fis: FileInputStream? = null
 
         try {
-            fis = FileInputStream(videoFile)
-            retriever.setDataSource(fis.fd, 0L, videoFile.length())
+            try {
+                fis = FileInputStream(videoFile)
+                retriever.setDataSource(fis.fd, 0L, videoFile.length())
+            } catch (e: Throwable) {
+                retriever.setDataSource(videoFile.absolutePath)
+            }
 
             val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
             val durationMs = durationStr?.toLongOrNull() ?: 2000L

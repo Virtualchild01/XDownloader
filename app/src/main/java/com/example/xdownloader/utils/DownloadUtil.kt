@@ -202,13 +202,13 @@ object DownloadUtil {
                 }
                 Uri.fromFile(targetFile)
             }
-        } catch (_: Exception) {
+        } catch (ignored: Exception) {
             null
         }
     }
 
     fun sanitizeFilename(name: String): String {
-        return name.replace(Regex("[^a-zA-Z0-9а-яА-ЯёЁ._\\-\\s]"), "")
+        return name.filter { it.isLetterOrDigit() || it == '_' || it == '-' || it == '.' || it == ' ' }
             .trim()
             .take(45)
             .ifEmpty { "Post" }
