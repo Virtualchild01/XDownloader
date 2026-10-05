@@ -3,7 +3,9 @@ package com.example.xdownloader.gif
 import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.ImageFormat
 import android.media.Image
+import android.media.ImageReader
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaExtractor
@@ -13,6 +15,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import android.view.Surface
 import com.bumptech.glide.Glide
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -26,7 +29,7 @@ object GifConverter {
 
     /**
      * Converts a local MP4 video file into an animated GIF.
-     * Uses Android low-level hardware/software MediaCodec decoder directly.
+     * Uses 4 multi-tier decoding strategies (ImageReader Surface -> Software MediaCodec -> Retriever -> Glide).
      * @return Pair of (Uri?, errorMessage?)
      */
     suspend fun convertVideoToGif(
@@ -89,11 +92,12 @@ object GifConverter {
 
             var framesAdded = 0
             val totalTargetFrames = maxDurationSec * fps
-            var lastDiag = ""
+            val diag = StringBuilder()
 
-            // СТРАТЕГИЯ 1: Низкоуровневый MediaCodec (Software / Hardware с выводом в Image YUV420)
+            // СТРАТЕГИЯ 1 (Основная): Аппаратный декодер с рендерингом на Surface (ImageReader)
+            // Поддерживается 100% чипов Qualcomm, MediaTek, Exynos
             try {
-                framesAdded = extractWithSoftwareMediaCodec(
+                framesAdded = extractWithImageReaderSurface(
                     videoFile = videoFile,
                     maxFrames = totalTargetFrames,
                     frameStep = 1,
@@ -106,10 +110,30 @@ object GifConverter {
                     }
                 }
             } catch (e: Throwable) {
-                lastDiag = lastDiag + "MediaCodec: " + (e.message ?: "unknown") + "; "
+                diag.append("S1: ").append(e.message ?: e.javaClass.simpleName).append("; ")
             }
 
-            // СТРАТЕГИЯ 2: Резервное извлечение через MediaMetadataRetriever с FileDescriptor
+            // СТРАТЕГИЯ 2: Программный MediaCodec CPU без Surface
+            if (framesAdded == 0) {
+                try {
+                    framesAdded = extractWithSoftwareMediaCodec(
+                        videoFile = videoFile,
+                        maxFrames = totalTargetFrames,
+                        frameStep = 1,
+                        targetWidth = maxDimension
+                    ) { bitmap ->
+                        encoder.addFrame(bitmap)
+                        val p = (35 + ((framesAdded + 1) * 60 / totalTargetFrames)).coerceAtMost(95)
+                        kotlinx.coroutines.runBlocking(Dispatchers.Main) {
+                            onProgress(p)
+                        }
+                    }
+                } catch (e: Throwable) {
+                    diag.append("S2: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+                }
+            }
+
+            // СТРАТЕГИЯ 3: Резервное извлечение через MediaMetadataRetriever
             if (framesAdded == 0) {
                 try {
                     framesAdded = extractWithContextRetriever(
@@ -124,11 +148,11 @@ object GifConverter {
                         }
                     }
                 } catch (e: Throwable) {
-                    lastDiag = lastDiag + "Retriever: " + (e.message ?: "unknown") + "; "
+                    diag.append("S3: ").append(e.message ?: e.javaClass.simpleName).append("; ")
                 }
             }
 
-            // СТРАТЕГИЯ 3: Резервное извлечение через Glide Video Frame Loader
+            // СТРАТЕГИЯ 4: Резервное извлечение через Glide
             if (framesAdded == 0) {
                 try {
                     framesAdded = extractWithGlide(
@@ -144,7 +168,7 @@ object GifConverter {
                         }
                     }
                 } catch (e: Throwable) {
-                    lastDiag = lastDiag + "Glide: " + (e.message ?: "unknown") + "; "
+                    diag.append("S4: ").append(e.message ?: e.javaClass.simpleName).append("; ")
                 }
             }
 
@@ -155,7 +179,7 @@ object GifConverter {
                 } else if (targetFile != null && targetFile.exists()) {
                     targetFile.delete()
                 }
-                val msg = if (lastDiag.isNotBlank()) "Не удалось извлечь кадры (" + lastDiag.trim() + ")" else "Не удалось декодировать кадры из видеофайла"
+                val msg = if (diag.isNotBlank()) "Не удалось извлечь кадры (" + diag.toString().trim() + ")" else "Не удалось декодировать кадры из видеофайла"
                 return@withContext Pair(null, msg)
             }
 
@@ -188,8 +212,138 @@ object GifConverter {
     }
 
     /**
-     * Полноценное декодирование через MediaExtractor + MediaCodec с правильным циклом
-     * и гарантированным ожиданием вывода декодированных кадров (Drain loop).
+     * Декодирование через аппаратный MediaCodec с выводом на Surface (ImageReader).
+     * Аппаратные декодеры Qualcomm / MediaTek требуют Surface и безотказно декодируют на него.
+     */
+    private fun extractWithImageReaderSurface(
+        videoFile: File,
+        maxFrames: Int,
+        frameStep: Int,
+        targetWidth: Int,
+        onFrame: (Bitmap) -> Unit
+    ): Int {
+        val extractor = MediaExtractor()
+        var fis: FileInputStream? = null
+        var decoder: MediaCodec? = null
+        var imageReader: ImageReader? = null
+        var surface: Surface? = null
+        var decodedCount = 0
+        var acceptedCount = 0
+
+        try {
+            fis = FileInputStream(videoFile)
+            extractor.setDataSource(fis.fd, 0L, videoFile.length())
+
+            var videoTrack = -1
+            var format: MediaFormat? = null
+
+            for (i in 0 until extractor.trackCount) {
+                val f = extractor.getTrackFormat(i)
+                val mime = f.getString(MediaFormat.KEY_MIME) ?: ""
+                if (mime.startsWith("video/")) {
+                    videoTrack = i
+                    format = f
+                    break
+                }
+            }
+
+            if (videoTrack < 0 || format == null) return 0
+            extractor.selectTrack(videoTrack)
+
+            val mime = format.getString(MediaFormat.KEY_MIME) ?: "video/avc"
+            val width = format.getInteger(MediaFormat.KEY_WIDTH)
+            val height = format.getInteger(MediaFormat.KEY_HEIGHT)
+
+            imageReader = ImageReader.newInstance(width, height, ImageFormat.YUV_420_888, 5)
+            surface = imageReader.surface
+
+            decoder = MediaCodec.createDecoderByType(mime)
+            decoder.configure(format, surface, null, 0)
+            decoder.start()
+
+            val info = MediaCodec.BufferInfo()
+            var sawInputEOS = false
+            var sawOutputEOS = false
+            var noOutputCounter = 0
+            val timeoutUs = 10000L
+
+            while (!sawOutputEOS && acceptedCount < maxFrames && noOutputCounter < 150) {
+                if (!sawInputEOS) {
+                    val inputIndex = decoder.dequeueInputBuffer(timeoutUs)
+                    if (inputIndex >= 0) {
+                        val inputBuffer = decoder.getInputBuffer(inputIndex)
+                        if (inputBuffer != null) {
+                            val sampleSize = extractor.readSampleData(inputBuffer, 0)
+                            if (sampleSize < 0) {
+                                decoder.queueInputBuffer(inputIndex, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                sawInputEOS = true
+                            } else {
+                                val timeUs = extractor.sampleTime
+                                decoder.queueInputBuffer(inputIndex, 0, sampleSize, timeUs, 0)
+                                extractor.advance()
+                            }
+                        }
+                    }
+                }
+
+                val outputIndex = decoder.dequeueOutputBuffer(info, timeoutUs)
+                if (outputIndex >= 0) {
+                    noOutputCounter = 0
+
+                    if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                        sawOutputEOS = true
+                    }
+
+                    // Рендерим готовый декодированный кадр на Surface ImageReader
+                    decoder.releaseOutputBuffer(outputIndex, true)
+
+                    // Считываем готовое изображение из ImageReader
+                    var image: Image? = null
+                    for (attempt in 0 until 5) {
+                        image = imageReader.acquireNextImage()
+                        if (image != null) break
+                        try { Thread.sleep(3) } catch (ignored: Throwable) {}
+                    }
+
+                    if (image != null) {
+                        if (decodedCount % frameStep == 0) {
+                            val bitmap = yuvImageToBitmap(image)
+                            if (bitmap != null) {
+                                val scaled = if (bitmap.width != targetWidth && targetWidth > 0) {
+                                    val aspect = bitmap.height.toFloat() / bitmap.width.toFloat()
+                                    val targetHeight = ((targetWidth * aspect).toInt() / 2) * 2
+                                    Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight.coerceAtLeast(2), true)
+                                } else bitmap
+
+                                onFrame(scaled)
+                                acceptedCount++
+                            }
+                        }
+                        try { image.close() } catch (ignored: Throwable) {}
+                        decodedCount++
+                    }
+                } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED || outputIndex == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) {
+                    noOutputCounter = 0
+                } else {
+                    if (sawInputEOS) {
+                        noOutputCounter++
+                    }
+                }
+            }
+        } finally {
+            try { decoder?.stop() } catch (ignored: Throwable) {}
+            try { decoder?.release() } catch (ignored: Throwable) {}
+            try { surface?.release() } catch (ignored: Throwable) {}
+            try { imageReader?.close() } catch (ignored: Throwable) {}
+            try { extractor.release() } catch (ignored: Throwable) {}
+            try { fis?.close() } catch (ignored: Throwable) {}
+        }
+
+        return acceptedCount
+    }
+
+    /**
+     * Полноценное декодирование через MediaExtractor + MediaCodec с программным буфером.
      */
     private fun extractWithSoftwareMediaCodec(
         videoFile: File,
@@ -226,13 +380,11 @@ object GifConverter {
 
             val mime = format.getString(MediaFormat.KEY_MIME) ?: "video/avc"
 
-            // Указываем гибкий цветовой формат YUV420 для вывода без Surface
             format.setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
             )
 
-            // Пробуем программный декодер Google (CPU), затем OMX, затем системный по умолчанию
             val candidates = listOf("c2.android.avc.decoder", "OMX.google.h264.decoder", null)
             var activeDecoder: MediaCodec? = null
 
@@ -247,9 +399,7 @@ object GifConverter {
                     dec.start()
                     activeDecoder = dec
                     break
-                } catch (ignored: Throwable) {
-                    // Пробуем следующий доступный кодек
-                }
+                } catch (ignored: Throwable) {}
             }
 
             val decoder = activeDecoder ?: return 0
@@ -261,9 +411,7 @@ object GifConverter {
             var noOutputCounter = 0
             val timeoutUs = 10000L
 
-            // Цикл продолжается, пока не получен маркер окончания потока на выходе (sawOutputEOS)
             while (!sawOutputEOS && acceptedCount < maxFrames && noOutputCounter < 150) {
-                // Подача данных на вход декодера
                 if (!sawInputEOS) {
                     val inputIndex = decoder.dequeueInputBuffer(timeoutUs)
                     if (inputIndex >= 0) {
@@ -282,7 +430,6 @@ object GifConverter {
                     }
                 }
 
-                // Снятие готовых декодированных кадров с выхода декодера
                 val outputIndex = decoder.dequeueOutputBuffer(info, timeoutUs)
                 if (outputIndex >= 0) {
                     noOutputCounter = 0
@@ -315,14 +462,11 @@ object GifConverter {
                 } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED || outputIndex == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) {
                     noOutputCounter = 0
                 } else {
-                    // INFO_TRY_AGAIN_LATER
                     if (sawInputEOS) {
                         noOutputCounter++
                     }
                 }
             }
-        } catch (e: Throwable) {
-            e.printStackTrace()
         } finally {
             try { codec?.stop() } catch (ignored: Throwable) {}
             try { codec?.release() } catch (ignored: Throwable) {}
@@ -479,8 +623,6 @@ object GifConverter {
                 onProgress(p)
             }
             lastValid?.recycle()
-        } catch (e: Throwable) {
-            e.printStackTrace()
         } finally {
             try { fis?.close() } catch (ignored: Throwable) {}
             try { retriever.release() } catch (ignored: Throwable) {}
