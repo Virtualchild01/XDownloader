@@ -1,19 +1,15 @@
 package com.example.xdownloader.utils
 
 import android.app.DownloadManager
-import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
-import android.os.Build
 import android.os.Environment
-import android.provider.MediaStore
 import com.example.xdownloader.gif.GifConverter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.concurrent.TimeUnit
 
@@ -59,8 +55,7 @@ object DownloadUtil {
 
     /**
      * Downloads video stream and converts it into a pure animated GIF file.
-     * If GIF conversion fails, gracefully saves original stream as MP4 into Downloads.
-     * @return Pair of (Uri?, statusMessage?)
+     * @return Pair of (Uri?, errorMessage?)
      */
     suspend fun downloadAndConvertToGif(
         context: Context,
@@ -69,7 +64,9 @@ object DownloadUtil {
         onStatusUpdate: (String) -> Unit,
         onProgress: (Int) -> Unit
     ): Pair<Uri?, String?> = withContext(Dispatchers.IO) {
-        val tempVideoFile = File(context.cacheDir, "temp_x_${System.currentTimeMillis()}.mp4")
+        // Сохраняем в getExternalFilesDir, где у системного mediaserver есть доступ на чтение
+        val baseDir = context.getExternalFilesDir(null) ?: context.cacheDir
+        val tempVideoFile = File(baseDir, "temp_x_${System.currentTimeMillis()}.mp4")
         try {
             withContext(Dispatchers.Main) {
                 onStatusUpdate("Загрузка видеопотока...")
@@ -145,17 +142,7 @@ object DownloadUtil {
                 onProgress(totalProgress)
             }
 
-            if (gifUri != null) {
-                return@withContext Pair(gifUri, null)
-            }
-
-            // РЕЗЕРВ: Если декодер устройства не смог создать GIF, сохраняем оригинальное видео в Загрузки
-            val fallbackMp4Uri = saveVideoToDownloads(context, tempVideoFile, "X_${sanitizeFilename(title)}_anim")
-            if (fallbackMp4Uri != null) {
-                return@withContext Pair(fallbackMp4Uri, "SAVED_AS_MP4")
-            }
-
-            Pair(null, gifErr ?: "Не удалось создать анимацию")
+            Pair(gifUri, gifErr)
         } catch (e: Exception) {
             e.printStackTrace()
             Pair(null, e.message ?: "Неизвестная ошибка")
@@ -163,40 +150,6 @@ object DownloadUtil {
             if (tempVideoFile.exists()) {
                 tempVideoFile.delete()
             }
-        }
-    }
-
-    private fun saveVideoToDownloads(context: Context, videoFile: File, title: String): Uri? {
-        return try {
-            val fileName = "${title}.mp4"
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                    put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
-                }
-                val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                if (uri != null) {
-                    context.contentResolver.openOutputStream(uri)?.use { out ->
-                        FileInputStream(videoFile).use { input ->
-                            input.copyTo(out)
-                        }
-                    }
-                }
-                uri
-            } else {
-                val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                if (!dir.exists()) dir.mkdirs()
-                val target = File(dir, fileName)
-                FileInputStream(videoFile).use { input ->
-                    FileOutputStream(target).use { output ->
-                        input.copyTo(output)
-                    }
-                }
-                Uri.fromFile(target)
-            }
-        } catch (_: Exception) {
-            null
         }
     }
 

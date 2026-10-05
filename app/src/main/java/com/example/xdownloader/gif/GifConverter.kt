@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import com.bumptech.glide.Glide
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -43,15 +44,16 @@ object GifConverter {
 
         try {
             fis = FileInputStream(videoFile)
-            // ПРАВИЛЬНЫЙ способ: передаем fd с начальным смещением 0 и точной длиной файла.
-            // При этом держим fis открытым до самого конца извлечения кадров!
             var setSuccess = false
             var setErr = ""
+
+            // 1. Попытка через FileDescriptor с точным смещением и длиной
             try {
                 retriever.setDataSource(fis.fd, 0L, videoFile.length())
                 setSuccess = true
             } catch (e1: Exception) {
                 setErr = e1.message ?: "fd error"
+                // 2. Попытка через абсолютный путь
                 try {
                     retriever.setDataSource(videoFile.absolutePath)
                     setSuccess = true
@@ -60,13 +62,15 @@ object GifConverter {
                 }
             }
 
-            if (!setSuccess) {
-                return@withContext Pair(null, "Не удалось открыть видео: $setErr")
-            }
-
-            val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-            val widthStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
-            val heightStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+            val durationStr = if (setSuccess) {
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+            } else null
+            val widthStr = if (setSuccess) {
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+            } else null
+            val heightStr = if (setSuccess) {
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+            } else null
 
             val durationMs = durationStr?.toLongOrNull() ?: 3000L
             val actualDurationMs = min(durationMs, maxDurationSec * 1000L).coerceAtLeast(400L)
@@ -122,7 +126,7 @@ object GifConverter {
             val encoder = AnimatedGifEncoder()
             encoder.setSize(targetW, targetH)
             encoder.setDelay(frameIntervalMs.toInt())
-            encoder.setRepeat(0)
+            encoder.setRepeat(0) // бесконечный цикл
             encoder.setQuality(10)
             encoder.start(outStream)
 
@@ -133,39 +137,63 @@ object GifConverter {
                 val timeUs = i * frameIntervalMs * 1000L
                 var frame: Bitmap? = null
 
-                // Вариант 1 (Android 9+): прямое декодирование по индексу кадра
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                // 1. Извлечение кадра по индексу (Android 9+)
+                if (setSuccess && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                     try {
                         frame = retriever.getFrameAtIndex(i)
                     } catch (_: Throwable) {}
                 }
 
-                // Вариант 2: точный таймкод (OPTION_CLOSEST)
-                if (frame == null) {
+                // 2. Извлечение по точному времени (OPTION_CLOSEST)
+                if (frame == null && setSuccess) {
                     try {
                         frame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
                     } catch (_: Throwable) {}
                 }
 
-                // Вариант 3: стандартный getFrameAtTime
-                if (frame == null) {
+                // 3. Стандартный поиск
+                if (frame == null && setSuccess) {
                     try {
                         frame = retriever.getFrameAtTime(timeUs)
                     } catch (_: Throwable) {}
                 }
 
-                // Вариант 4: ключевой кадр
-                if (frame == null) {
+                // 4. По ключевому кадру (SYNC)
+                if (frame == null && setSuccess) {
                     try {
                         frame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     } catch (_: Throwable) {}
                 }
 
-                // Вариант 5: первый кадр для начала
-                if (frame == null && i == 0) {
+                // 5. Декодирование через Glide (проверенный системный декодер Glide для видео)
+                if (frame == null) {
                     try {
-                        frame = retriever.frameAtTime
+                        frame = Glide.with(context.applicationContext)
+                            .asBitmap()
+                            .load(videoFile)
+                            .frame(timeUs)
+                            .submit(targetW, targetH)
+                            .get()
                     } catch (_: Throwable) {}
+                }
+
+                // 6. Резерв первого кадра для старта анимации
+                if (frame == null && i == 0) {
+                    if (setSuccess) {
+                        try {
+                            frame = retriever.frameAtTime
+                        } catch (_: Throwable) {}
+                    }
+                    if (frame == null) {
+                        try {
+                            frame = Glide.with(context.applicationContext)
+                                .asBitmap()
+                                .load(videoFile)
+                                .frame(0L)
+                                .submit(targetW, targetH)
+                                .get()
+                        } catch (_: Throwable) {}
+                    }
                 }
 
                 val bitmapToUse = frame ?: lastValidBitmap
@@ -204,7 +232,7 @@ object GifConverter {
                 } else if (targetFile != null && targetFile.exists()) {
                     targetFile.delete()
                 }
-                return@withContext Pair(null, "Декодер не смог извлечь кадры (frames=0, dur=$durationMs)")
+                return@withContext Pair(null, "Декодер не смог извлечь кадры (frames=0)")
             }
 
             encoder.finish()

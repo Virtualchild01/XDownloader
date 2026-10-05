@@ -152,7 +152,7 @@ class MainActivity : AppCompatActivity() {
             if (uri != null) {
                 try {
                     val intent = Intent(Intent.ACTION_VIEW).apply {
-                        setDataAndType(uri, "*/*")
+                        setDataAndType(uri, "image/gif")
                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     }
                     startActivity(intent)
@@ -168,11 +168,11 @@ class MainActivity : AppCompatActivity() {
             if (uri != null) {
                 try {
                     val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                        type = "*/*"
+                        type = "image/gif"
                         putExtra(Intent.EXTRA_STREAM, uri)
                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     }
-                    startActivity(Intent.createChooser(shareIntent, "Поделиться файлом"))
+                    startActivity(Intent.createChooser(shareIntent, "Поделиться файлом GIF"))
                     return@setOnClickListener
                 } catch (_: Exception) {}
             }
@@ -366,17 +366,12 @@ class MainActivity : AppCompatActivity() {
 
                 if (uri != null) {
                     lastSavedFileUri = uri
-                    if (errorMsg == "SAVED_AS_MP4") {
-                        binding.tvStatus.text = "Анимация сохранена в «Загрузки» в формате MP4"
-                        Toast.makeText(this@MainActivity, "Анимация сохранена в «Загрузки» как MP4", Toast.LENGTH_LONG).show()
-                    } else {
-                        binding.tvStatus.text = "Готово! Анимация сохранена в «Загрузки»"
-                        Toast.makeText(this@MainActivity, getString(R.string.toast_gif_saved), Toast.LENGTH_LONG).show()
-                    }
+                    binding.tvStatus.text = "Готово! Анимация сохранена в «Загрузки»"
+                    Toast.makeText(this@MainActivity, getString(R.string.toast_gif_saved), Toast.LENGTH_LONG).show()
                 } else {
-                    val err = errorMsg ?: "Не удалось обработать поток"
+                    val err = errorMsg ?: "Не удалось создать GIF"
                     binding.tvStatus.text = "Ошибка: $err"
-                    Toast.makeText(this@MainActivity, "Ошибка: $err. Попробуйте формат MP4.", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this@MainActivity, "Ошибка: $err", Toast.LENGTH_LONG).show()
                 }
             }
         } else {
