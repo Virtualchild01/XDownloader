@@ -348,7 +348,7 @@ class MainActivity : AppCompatActivity() {
             binding.tvStatus.text = "Подготовка к конвертации GIF..."
 
             lifecycleScope.launch {
-                val uri = DownloadUtil.downloadAndConvertToGif(
+                val (uri, errorMsg) = DownloadUtil.downloadAndConvertToGif(
                     context = this@MainActivity,
                     videoUrl = format.downloadUrl,
                     title = title,
@@ -369,8 +369,9 @@ class MainActivity : AppCompatActivity() {
                     binding.tvStatus.text = "Готово! Анимация сохранена в «Загрузки»"
                     Toast.makeText(this@MainActivity, getString(R.string.toast_gif_saved), Toast.LENGTH_LONG).show()
                 } else {
-                    binding.tvStatus.text = "Ошибка при создании GIF"
-                    Toast.makeText(this@MainActivity, "Ошибка при создании GIF. Попробуйте формат MP4.", Toast.LENGTH_LONG).show()
+                    val err = errorMsg ?: "Не удалось обработать поток"
+                    binding.tvStatus.text = "Ошибка: $err"
+                    Toast.makeText(this@MainActivity, "Ошибка: $err. Попробуйте формат MP4.", Toast.LENGTH_LONG).show()
                 }
             }
         } else {

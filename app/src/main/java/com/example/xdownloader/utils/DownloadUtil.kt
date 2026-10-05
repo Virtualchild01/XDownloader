@@ -16,9 +16,10 @@ import java.util.concurrent.TimeUnit
 object DownloadUtil {
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(25, TimeUnit.SECONDS)
+        .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .followRedirects(true)
+        .followSslRedirects(true)
         .build()
 
     /**
@@ -54,6 +55,7 @@ object DownloadUtil {
 
     /**
      * Downloads video stream and converts it into a pure animated GIF file.
+     * @return Pair of (Uri?, errorMessage?)
      */
     suspend fun downloadAndConvertToGif(
         context: Context,
@@ -61,7 +63,7 @@ object DownloadUtil {
         title: String,
         onStatusUpdate: (String) -> Unit,
         onProgress: (Int) -> Unit
-    ): Uri? = withContext(Dispatchers.IO) {
+    ): Pair<Uri?, String?> = withContext(Dispatchers.IO) {
         val tempVideoFile = File(context.cacheDir, "temp_x_${System.currentTimeMillis()}.mp4")
         try {
             withContext(Dispatchers.Main) {
@@ -69,7 +71,6 @@ object DownloadUtil {
                 onProgress(5)
             }
 
-            // Download MP4 to cache with realistic browser headers
             val request = Request.Builder()
                 .url(videoUrl)
                 .header(
@@ -79,34 +80,47 @@ object DownloadUtil {
                 .header("Accept", "*/*")
                 .build()
 
-            httpClient.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) throw Exception("Ошибка загрузки видео (HTTP ${response.code})")
-                val body = response.body ?: throw Exception("Пустой ответ сервера")
-                val totalBytes = body.contentLength()
+            var downloadError: String? = null
 
-                body.byteStream().use { input ->
-                    FileOutputStream(tempVideoFile).use { output ->
-                        val buffer = ByteArray(8192)
-                        var bytesRead: Int
-                        var downloaded = 0L
+            try {
+                httpClient.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        downloadError = "HTTP ${response.code}"
+                    } else {
+                        val body = response.body
+                        if (body == null) {
+                            downloadError = "Пустой ответ сервера"
+                        } else {
+                            val totalBytes = body.contentLength()
+                            body.byteStream().use { input ->
+                                FileOutputStream(tempVideoFile).use { output ->
+                                    val buffer = ByteArray(8192)
+                                    var bytesRead: Int
+                                    var downloaded = 0L
 
-                        while (input.read(buffer).also { bytesRead = it } != -1) {
-                            output.write(buffer, 0, bytesRead)
-                            downloaded += bytesRead
-                            if (totalBytes > 0) {
-                                val downloadPercent = (downloaded * 30 / totalBytes).toInt().coerceIn(5, 30)
-                                withContext(Dispatchers.Main) {
-                                    onProgress(downloadPercent)
+                                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                                        output.write(buffer, 0, bytesRead)
+                                        downloaded += bytesRead
+                                        if (totalBytes > 0) {
+                                            val downloadPercent = (downloaded * 30 / totalBytes).toInt().coerceIn(5, 30)
+                                            withContext(Dispatchers.Main) {
+                                                onProgress(downloadPercent)
+                                            }
+                                        }
+                                    }
+                                    output.flush()
                                 }
                             }
                         }
-                        output.flush()
                     }
                 }
+            } catch (e: Exception) {
+                downloadError = e.message ?: "Сбой соединения"
             }
 
-            if (!tempVideoFile.exists() || tempVideoFile.length() < 1000L) {
-                throw Exception("Скачанный видеофайл пуст или неполный (${tempVideoFile.length()} байт)")
+            if (downloadError != null || !tempVideoFile.exists() || tempVideoFile.length() < 1000L) {
+                val err = downloadError ?: "Файл не скачался"
+                return@withContext Pair(null, "Ошибка загрузки ($err)")
             }
 
             withContext(Dispatchers.Main) {
@@ -114,24 +128,22 @@ object DownloadUtil {
                 onProgress(35)
             }
 
-            // Convert to GIF
-            val gifUri = GifConverter.convertVideoToGif(
+            val (gifUri, gifErr) = GifConverter.convertVideoToGif(
                 context = context,
                 videoFile = tempVideoFile,
                 targetTitle = "X_${sanitizeFilename(title)}",
-                maxDurationSec = 12,
+                maxDurationSec = 10,
                 fps = 10,
-                maxDimension = 360
+                maxDimension = 320
             ) { gifPercent ->
-                // Progress from 35% to 100%
                 val totalProgress = 35 + (gifPercent * 65 / 100)
                 onProgress(totalProgress)
             }
 
-            gifUri
+            Pair(gifUri, gifErr)
         } catch (e: Exception) {
             e.printStackTrace()
-            null
+            Pair(null, e.message ?: "Неизвестная ошибка")
         } finally {
             if (tempVideoFile.exists()) {
                 tempVideoFile.delete()
