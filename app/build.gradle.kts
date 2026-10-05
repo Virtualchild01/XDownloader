@@ -59,6 +59,12 @@ android {
     }
 }
 
+configurations.all {
+    resolutionStrategy {
+        force("com.google.code.findbugs:jsr305:3.0.2")
+    }
+}
+
 dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
@@ -80,4 +86,5 @@ dependencies {
 
     // Pure Java H.264 / MP4 frame extractor (100% device & OEM independent)
     implementation("org.jcodec:jcodec:0.2.5")
+    implementation("org.jcodec:jcodec-android:0.2.5")
 }

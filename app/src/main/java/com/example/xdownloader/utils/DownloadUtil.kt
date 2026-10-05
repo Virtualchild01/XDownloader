@@ -162,7 +162,7 @@ object DownloadUtil {
                 targetTitle = "X_${sanitizeFilename(title)}",
                 maxDurationSec = 10,
                 fps = 10,
-                maxDimension = 320
+                maxDimension = 540
             ) { gifPercent ->
                 val totalProgress = 35 + (gifPercent * 65 / 100)
                 onProgress(totalProgress)

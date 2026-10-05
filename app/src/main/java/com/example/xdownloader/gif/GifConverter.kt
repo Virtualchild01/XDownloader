@@ -13,6 +13,7 @@ import com.bumptech.glide.Glide
 import com.bumptech.glide.request.RequestOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.jcodec.android.AndroidUtil
 import org.jcodec.api.FrameGrab
 import org.jcodec.common.io.NIOUtils
 import org.jcodec.common.io.SeekableByteChannel
@@ -37,8 +38,8 @@ object GifConverter {
         videoFile: File,
         targetTitle: String,
         maxDurationSec: Int = 10,
-        fps: Int = 15,
-        maxDimension: Int = 320,
+        fps: Int = 10,
+        maxDimension: Int = 540,
         onProgress: (Int) -> Unit
     ): Pair<Uri?, String?> = withContext(Dispatchers.IO) {
         if (!videoFile.exists() || !videoFile.canRead() || videoFile.length() < 1000L) {
@@ -89,7 +90,7 @@ object GifConverter {
             }
 
             val encoder = AnimatedGifEncoder()
-            encoder.setDelay(1000 / fps)
+            encoder.setDelay(100) // По умолчанию 100 мс (10 fps)
             encoder.setRepeat(0) // 0 = бесконечный цикл
             encoder.setQuality(10)
             encoder.start(outStream)
@@ -220,7 +221,9 @@ object GifConverter {
 
                 val bitmap = jcodecPictureToBitmap(pic)
                 if (bitmap != null) {
-                    val scaled = if (bitmap.width != targetWidth && targetWidth > 0) {
+                    // Масштабируем ТОЛЬКО если ширина кадра превышает targetWidth.
+                    // Если исходное видео 500x500 (стандартный GIF твиттера), сохраняем исходный размер 1:1!
+                    val scaled = if (targetWidth > 0 && bitmap.width > targetWidth) {
                         val aspect = bitmap.height.toFloat() / bitmap.width.toFloat()
                         val targetHeight = ((targetWidth * aspect).toInt() / 2) * 2
                         val s = Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight.coerceAtLeast(2), true)
@@ -236,9 +239,23 @@ object GifConverter {
             if (decodedBitmaps.isEmpty()) return 0
 
             val totalFrames = decodedBitmaps.size
-            // Рассчитываем задержку на кадр: для 20-30 кадров около 50-66 мс (~15-20 кадров/сек)
-            val estimatedDurationMs = (totalFrames * 45).coerceIn(600, 5000)
-            val delayPerFrameMs = (estimatedDurationMs / totalFrames).coerceIn(40, 100)
+
+            // Извлекаем точную длительность исходного видео (в мс) через MediaMetadataRetriever
+            var videoDurationMs = 0L
+            try {
+                val mmr = MediaMetadataRetriever()
+                mmr.setDataSource(videoFile.absolutePath)
+                videoDurationMs = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                mmr.release()
+            } catch (ignored: Throwable) {}
+
+            // Рассчитываем точную задержку между кадрами для сохранения оригинальной скорости
+            // Ограничиваем разумными пределами: 70..140 мс (~7-14 fps), по умолчанию 95 мс (~10.5 fps)
+            val delayPerFrameMs = if (videoDurationMs > 0L) {
+                (videoDurationMs.toDouble() / totalFrames).toInt().coerceIn(70, 140)
+            } else {
+                95
+            }
 
             encoder.setDelay(delayPerFrameMs)
             encoder.setRepeat(0) // Бесконечный цикл
@@ -262,18 +279,27 @@ object GifConverter {
     }
 
     /**
-     * Конвертация Picture (YUV) из JCodec в стандартный Android ARGB_8888 Bitmap
-     * с правильным преобразованием знакового диапазона байтов [-128..127] в [0..255].
+     * Конвертация Picture из JCodec в стандартный Android ARGB_8888 Bitmap
+     * с сохранением 100% исходной яркости и правильным цветовым пространством.
      */
     private fun jcodecPictureToBitmap(src: Picture): Bitmap? {
         return try {
+            val cleanPic = if (src.crop != null) src.createCropped() else src
+
+            // 1. Официальный конвертер JCodec для Android
+            try {
+                val bmp = AndroidUtil.toBitmap(cleanPic)
+                if (bmp != null) return bmp
+            } catch (ignored: Throwable) {}
+
+            // 2. Резервный конвертер с правильным преобразованием YUV -> RGB (без затемнения)
             val rgbPic: Picture
-            if (src.color == ColorSpace.RGB) {
-                rgbPic = src
+            if (cleanPic.color == ColorSpace.RGB) {
+                rgbPic = cleanPic
             } else {
-                val transform = ColorUtil.getTransform(src.color, ColorSpace.RGB)
-                rgbPic = Picture.create(src.width, src.height, ColorSpace.RGB)
-                transform.transform(src, rgbPic)
+                val transform = ColorUtil.getTransform(cleanPic.color, ColorSpace.RGB)
+                rgbPic = Picture.create(cleanPic.width, cleanPic.height, ColorSpace.RGB)
+                transform.transform(cleanPic, rgbPic)
             }
 
             val w = rgbPic.width
@@ -285,10 +311,10 @@ object GifConverter {
 
             for (i in 0 until (w * h)) {
                 if (bi + 2 < limit) {
-                    // Знаковые байты JCodec [-128..127] смещаются на +128 в диапазон [0..255]
-                    val r = (bytes[bi++].toInt() + 128).coerceIn(0, 255)
-                    val g = (bytes[bi++].toInt() + 128).coerceIn(0, 255)
-                    val b = (bytes[bi++].toInt() + 128).coerceIn(0, 255)
+                    // Беззнаковое преобразование байта (and 0xFF) даёт точные значения 0..255
+                    val r = bytes[bi++].toInt() and 0xFF
+                    val g = bytes[bi++].toInt() and 0xFF
+                    val b = bytes[bi++].toInt() and 0xFF
                     pixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
                 } else {
                     pixels[i] = -0x1000000
@@ -380,6 +406,8 @@ object GifConverter {
             val frameIntervalMs = 1000L / fps
             val totalFrames = (actualDurationMs / frameIntervalMs).toInt().coerceIn(2, 60)
 
+            encoder.setDelay(frameIntervalMs.toInt())
+
             var lastValid: Bitmap? = null
 
             for (i in 0 until totalFrames) {
@@ -420,7 +448,7 @@ object GifConverter {
 
                 val toUse = frame ?: lastValid
                 if (toUse != null) {
-                    val scaled = if (toUse.width != maxDimension && maxDimension > 0) {
+                    val scaled = if (maxDimension > 0 && toUse.width > maxDimension) {
                         val aspect = toUse.height.toFloat() / toUse.width.toFloat()
                         val targetHeight = ((maxDimension * aspect).toInt() / 2) * 2
                         Bitmap.createScaledBitmap(toUse, maxDimension, targetHeight.coerceAtLeast(2), true)
@@ -466,6 +494,7 @@ object GifConverter {
         try {
             val totalFrames = maxDurationSec * fps
             val frameIntervalMs = 1000L / fps
+            encoder.setDelay(frameIntervalMs.toInt())
             var lastValid: Bitmap? = null
 
             for (i in 0 until totalFrames) {
@@ -493,7 +522,7 @@ object GifConverter {
 
                 val toUse = frame ?: lastValid
                 if (toUse != null) {
-                    val scaled = if (toUse.width != maxDimension && maxDimension > 0) {
+                    val scaled = if (maxDimension > 0 && toUse.width > maxDimension) {
                         val aspect = toUse.height.toFloat() / toUse.width.toFloat()
                         val targetHeight = ((maxDimension * aspect).toInt() / 2) * 2
                         Bitmap.createScaledBitmap(toUse, maxDimension, targetHeight.coerceAtLeast(2), true)
