@@ -44,7 +44,9 @@ object GifConverter {
             return@withContext Pair(null, "Видеофайл пуст или не прочитан (" + videoFile.length() + " байт)")
         }
 
-        videoFile.setReadable(true, false)
+        try {
+            videoFile.setReadable(true, false)
+        } catch (ignored: Throwable) {}
 
         withContext(Dispatchers.Main) {
             onProgress(35)
@@ -95,7 +97,7 @@ object GifConverter {
             val totalTargetFrames = maxDurationSec * fps
             val diagLog = StringBuilder()
 
-            // УРОВЕНЬ 1 (Основной): Универсальный MediaMetadataRetriever со всеми способами передачи дескриптора и кадров
+            // УРОВЕНЬ 1 (Основной): Универсальный MediaMetadataRetriever через ParcelFileDescriptor / абсолютный путь
             try {
                 framesAdded = extractWithRetriever(
                     context = context,
@@ -103,14 +105,15 @@ object GifConverter {
                     maxDurationSec = maxDurationSec,
                     fps = fps,
                     maxDimension = maxDimension,
-                    encoder = encoder
+                    encoder = encoder,
+                    diagLog = diagLog
                 ) { p ->
                     kotlinx.coroutines.runBlocking(Dispatchers.Main) {
                         onProgress(p)
                     }
                 }
             } catch (e: Throwable) {
-                diagLog.append("MMR: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+                diagLog.append("RetrieverEx: ").append(e.message ?: e.javaClass.simpleName).append("; ")
             }
 
             // УРОВЕНЬ 2: Извлечение через Glide Video Frame Loader (RequestOptions.frameOf)
@@ -129,11 +132,11 @@ object GifConverter {
                         }
                     }
                 } catch (e: Throwable) {
-                    diagLog.append("Glide: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+                    diagLog.append("GlideEx: ").append(e.message ?: e.javaClass.simpleName).append("; ")
                 }
             }
 
-            // УРОВЕНЬ 3: MediaCodec программное декодирование
+            // УРОВЕНЬ 3: MediaCodec программное декодирование на CPU
             if (framesAdded == 0) {
                 try {
                     framesAdded = extractWithSoftwareMediaCodec(
@@ -149,7 +152,7 @@ object GifConverter {
                         }
                     }
                 } catch (e: Throwable) {
-                    diagLog.append("Codec: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+                    diagLog.append("CodecEx: ").append(e.message ?: e.javaClass.simpleName).append("; ")
                 }
             }
 
@@ -160,7 +163,11 @@ object GifConverter {
                 } else if (targetFile != null && targetFile.exists()) {
                     targetFile.delete()
                 }
-                val msg = if (diagLog.isNotBlank()) "Не удалось извлечь кадры (" + diagLog.toString().trim() + ")" else "Не удалось декодировать кадры из видеофайла"
+                val msg = if (diagLog.isNotBlank()) {
+                    "Сбой извлечения кадров (" + diagLog.toString().trim() + ", размер: " + videoFile.length() + " Б)"
+                } else {
+                    "Не удалось декодировать кадры (размер файла: " + videoFile.length() + " Б)"
+                }
                 return@withContext Pair(null, msg)
             }
 
@@ -194,7 +201,7 @@ object GifConverter {
 
     /**
      * Надежное извлечение кадров через MediaMetadataRetriever.
-     * Пробует поочередно путь к файлу, открытый дескриптор и ParcelFileDescriptor.
+     * Пробует поочередно ParcelFileDescriptor, абсолютный путь, открытый FileInputStream и Uri.
      */
     private fun extractWithRetriever(
         context: Context,
@@ -203,6 +210,7 @@ object GifConverter {
         fps: Int,
         maxDimension: Int,
         encoder: AnimatedGifEncoder,
+        diagLog: StringBuilder,
         onProgress: (Int) -> Unit
     ): Int {
         var added = 0
@@ -213,15 +221,30 @@ object GifConverter {
         try {
             var initialized = false
 
-            // Попытка A: через абсолютный путь (самый быстрый и стандартный)
+            // Попытка 1: через ParcelFileDescriptor (официальный способ IPC на Android 10-15)
             try {
                 val testRetriever = MediaMetadataRetriever()
-                testRetriever.setDataSource(videoFile.absolutePath)
+                pfd = ParcelFileDescriptor.open(videoFile, ParcelFileDescriptor.MODE_READ_ONLY)
+                testRetriever.setDataSource(pfd.fileDescriptor)
                 retriever = testRetriever
                 initialized = true
-            } catch (ignored: Throwable) {}
+            } catch (e: Throwable) {
+                diagLog.append("PfdInit: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+            }
 
-            // Попытка B: через FileInputStream FD
+            // Попытка 2: через абсолютный путь (работает в Downloads и общедоступных папках)
+            if (!initialized) {
+                try {
+                    val testRetriever = MediaMetadataRetriever()
+                    testRetriever.setDataSource(videoFile.absolutePath)
+                    retriever = testRetriever
+                    initialized = true
+                } catch (e: Throwable) {
+                    diagLog.append("PathInit: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+                }
+            }
+
+            // Попытка 3: через FileInputStream FD
             if (!initialized) {
                 try {
                     val testRetriever = MediaMetadataRetriever()
@@ -229,28 +252,21 @@ object GifConverter {
                     testRetriever.setDataSource(fis.fd)
                     retriever = testRetriever
                     initialized = true
-                } catch (ignored: Throwable) {}
+                } catch (e: Throwable) {
+                    diagLog.append("FisInit: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+                }
             }
 
-            // Попытка C: через ParcelFileDescriptor
-            if (!initialized) {
-                try {
-                    val testRetriever = MediaMetadataRetriever()
-                    pfd = ParcelFileDescriptor.open(videoFile, ParcelFileDescriptor.MODE_READ_ONLY)
-                    testRetriever.setDataSource(pfd.fileDescriptor)
-                    retriever = testRetriever
-                    initialized = true
-                } catch (ignored: Throwable) {}
-            }
-
-            // Попытка D: через Context и Uri
+            // Попытка 4: через Context и Uri
             if (!initialized) {
                 try {
                     val testRetriever = MediaMetadataRetriever()
                     testRetriever.setDataSource(context, Uri.fromFile(videoFile))
                     retriever = testRetriever
                     initialized = true
-                } catch (ignored: Throwable) {}
+                } catch (e: Throwable) {
+                    diagLog.append("UriInit: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+                }
             }
 
             val mmr = retriever ?: return 0
@@ -268,40 +284,37 @@ object GifConverter {
                 val timeUs = i * frameIntervalMs * 1000L
                 var frame: Bitmap? = null
 
-                // Вариант 1: getScaledFrameAtTime (API 27+)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 && maxDimension > 0) {
-                    try {
-                        frame = mmr.getScaledFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST, maxDimension, maxDimension)
-                    } catch (ignored: Throwable) {}
-                    if (frame == null) {
-                        try {
-                            frame = mmr.getScaledFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, maxDimension, maxDimension)
-                        } catch (ignored: Throwable) {}
-                    }
-                }
+                // Способ A: getFrameAtTime с OPTION_CLOSEST_SYNC (гарантированно декодирует ключевой кадр)
+                try {
+                    frame = mmr.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                } catch (ignored: Throwable) {}
 
-                // Вариант 2: OPTION_CLOSEST
+                // Способ B: getFrameAtTime с OPTION_CLOSEST
                 if (frame == null) {
                     try {
                         frame = mmr.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
                     } catch (ignored: Throwable) {}
                 }
 
-                // Вариант 3: OPTION_CLOSEST_SYNC
-                if (frame == null) {
+                // Способ C: getScaledFrameAtTime (API 27+)
+                if (frame == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 && maxDimension > 0) {
                     try {
-                        frame = mmr.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                        val videoWidth = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: maxDimension
+                        val videoHeight = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: maxDimension
+                        val aspect = videoHeight.toFloat() / videoWidth.toFloat()
+                        val targetHeight = ((maxDimension * aspect).toInt() / 2) * 2
+                        frame = mmr.getScaledFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, maxDimension, targetHeight)
                     } catch (ignored: Throwable) {}
                 }
 
-                // Вариант 4: OPTION_PREVIOUS_SYNC
+                // Способ D: OPTION_PREVIOUS_SYNC
                 if (frame == null) {
                     try {
                         frame = mmr.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_PREVIOUS_SYNC)
                     } catch (ignored: Throwable) {}
                 }
 
-                // Вариант 5: базовый frameAtTime
+                // Способ E: базовый frameAtTime
                 if (frame == null && i == 0) {
                     try {
                         frame = mmr.frameAtTime
@@ -333,8 +346,8 @@ object GifConverter {
             lastValid?.recycle()
         } finally {
             try { retriever?.release() } catch (ignored: Throwable) {}
-            try { fis?.close() } catch (ignored: Throwable) {}
             try { pfd?.close() } catch (ignored: Throwable) {}
+            try { fis?.close() } catch (ignored: Throwable) {}
         }
 
         return added
@@ -375,7 +388,7 @@ object GifConverter {
                         frame = Glide.with(context.applicationContext)
                             .asBitmap()
                             .load(videoFile)
-                            .apply(RequestOptions.frameOf(-1L))
+                            .apply(RequestOptions.frameOf(0L))
                             .submit(maxDimension, maxDimension)
                             .get()
                     } catch (ignored: Throwable) {}
@@ -383,8 +396,15 @@ object GifConverter {
 
                 val toUse = frame ?: lastValid
                 if (toUse != null) {
-                    encoder.addFrame(toUse)
+                    val scaled = if (toUse.width != maxDimension && maxDimension > 0) {
+                        val aspect = toUse.height.toFloat() / toUse.width.toFloat()
+                        val targetHeight = ((maxDimension * aspect).toInt() / 2) * 2
+                        Bitmap.createScaledBitmap(toUse, maxDimension, targetHeight.coerceAtLeast(2), true)
+                    } else toUse
+
+                    encoder.addFrame(scaled)
                     added++
+
                     if (frame != null) {
                         if (lastValid != null && lastValid != frame) {
                             lastValid.recycle()

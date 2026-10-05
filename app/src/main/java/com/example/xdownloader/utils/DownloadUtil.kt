@@ -69,8 +69,13 @@ object DownloadUtil {
         onStatusUpdate: (String) -> Unit,
         onProgress: (Int) -> Unit
     ): Pair<Uri?, String?> = withContext(Dispatchers.IO) {
-        val baseDir = context.getExternalFilesDir(null) ?: context.cacheDir
-        val tempVideoFile = File(baseDir, "temp_x_${System.currentTimeMillis()}.mp4")
+        val baseDir = context.cacheDir
+        val tempVideoFile = File(baseDir, "temp_x_${System.currentTimeMillis()}.mp4").apply {
+            try {
+                setReadable(true, false)
+                setWritable(true, false)
+            } catch (ignored: Throwable) {}
+        }
         try {
             withContext(Dispatchers.Main) {
                 onStatusUpdate("Загрузка медиапотока...")
