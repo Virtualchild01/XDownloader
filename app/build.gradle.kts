@@ -15,6 +15,9 @@ android {
         versionName = "1.0.${(project.findProperty("versionCode") as? String) ?: "1"}"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        }
     }
 
     signingConfigs {
@@ -29,6 +32,9 @@ android {
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+        jniLibs {
+            pickFirsts += "**/libc++_shared.so"
         }
     }
 
@@ -77,4 +83,7 @@ dependencies {
 
     // Image loading for thumbnails and photos
     implementation("com.github.bumptech.glide:glide:4.16.0")
+
+    // Standalone native FFmpeg engine for bulletproof MP4-to-GIF conversion
+    implementation("com.arthenica:ffmpeg-kit-min:6.0-2")
 }
