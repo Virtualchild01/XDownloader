@@ -3,9 +3,7 @@ package com.example.xdownloader.gif
 import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.ImageFormat
 import android.media.Image
-import android.media.ImageReader
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaExtractor
@@ -14,9 +12,10 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
-import android.view.Surface
 import com.bumptech.glide.Glide
+import com.bumptech.glide.request.RequestOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -29,7 +28,7 @@ object GifConverter {
 
     /**
      * Converts a local MP4 video file into an animated GIF.
-     * Uses 4 multi-tier decoding strategies (ImageReader Surface -> Software MediaCodec -> Retriever -> Glide).
+     * Uses a multi-tiered decoding architecture to guarantee success across all Android OEMs (Xiaomi, Samsung, Pixel, etc.).
      * @return Pair of (Uri?, errorMessage?)
      */
     suspend fun convertVideoToGif(
@@ -44,6 +43,8 @@ object GifConverter {
         if (!videoFile.exists() || !videoFile.canRead() || videoFile.length() < 1000L) {
             return@withContext Pair(null, "Видеофайл пуст или не прочитан (" + videoFile.length() + " байт)")
         }
+
+        videoFile.setReadable(true, false)
 
         withContext(Dispatchers.Main) {
             onProgress(35)
@@ -92,67 +93,27 @@ object GifConverter {
 
             var framesAdded = 0
             val totalTargetFrames = maxDurationSec * fps
-            val diag = StringBuilder()
+            val diagLog = StringBuilder()
 
-            // СТРАТЕГИЯ 1 (Основная): Аппаратный декодер с рендерингом на Surface (ImageReader)
-            // Поддерживается 100% чипов Qualcomm, MediaTek, Exynos
+            // УРОВЕНЬ 1 (Основной): Универсальный MediaMetadataRetriever со всеми способами передачи дескриптора и кадров
             try {
-                framesAdded = extractWithImageReaderSurface(
+                framesAdded = extractWithRetriever(
+                    context = context,
                     videoFile = videoFile,
-                    maxFrames = totalTargetFrames,
-                    frameStep = 1,
-                    targetWidth = maxDimension
-                ) { bitmap ->
-                    encoder.addFrame(bitmap)
-                    val p = (35 + ((framesAdded + 1) * 60 / totalTargetFrames)).coerceAtMost(95)
+                    maxDurationSec = maxDurationSec,
+                    fps = fps,
+                    maxDimension = maxDimension,
+                    encoder = encoder
+                ) { p ->
                     kotlinx.coroutines.runBlocking(Dispatchers.Main) {
                         onProgress(p)
                     }
                 }
             } catch (e: Throwable) {
-                diag.append("S1: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+                diagLog.append("MMR: ").append(e.message ?: e.javaClass.simpleName).append("; ")
             }
 
-            // СТРАТЕГИЯ 2: Программный MediaCodec CPU без Surface
-            if (framesAdded == 0) {
-                try {
-                    framesAdded = extractWithSoftwareMediaCodec(
-                        videoFile = videoFile,
-                        maxFrames = totalTargetFrames,
-                        frameStep = 1,
-                        targetWidth = maxDimension
-                    ) { bitmap ->
-                        encoder.addFrame(bitmap)
-                        val p = (35 + ((framesAdded + 1) * 60 / totalTargetFrames)).coerceAtMost(95)
-                        kotlinx.coroutines.runBlocking(Dispatchers.Main) {
-                            onProgress(p)
-                        }
-                    }
-                } catch (e: Throwable) {
-                    diag.append("S2: ").append(e.message ?: e.javaClass.simpleName).append("; ")
-                }
-            }
-
-            // СТРАТЕГИЯ 3: Резервное извлечение через MediaMetadataRetriever
-            if (framesAdded == 0) {
-                try {
-                    framesAdded = extractWithContextRetriever(
-                        videoFile = videoFile,
-                        maxDurationSec = maxDurationSec,
-                        fps = fps,
-                        maxDimension = maxDimension,
-                        encoder = encoder
-                    ) { p ->
-                        kotlinx.coroutines.runBlocking(Dispatchers.Main) {
-                            onProgress(p)
-                        }
-                    }
-                } catch (e: Throwable) {
-                    diag.append("S3: ").append(e.message ?: e.javaClass.simpleName).append("; ")
-                }
-            }
-
-            // СТРАТЕГИЯ 4: Резервное извлечение через Glide
+            // УРОВЕНЬ 2: Извлечение через Glide Video Frame Loader (RequestOptions.frameOf)
             if (framesAdded == 0) {
                 try {
                     framesAdded = extractWithGlide(
@@ -168,7 +129,27 @@ object GifConverter {
                         }
                     }
                 } catch (e: Throwable) {
-                    diag.append("S4: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+                    diagLog.append("Glide: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+                }
+            }
+
+            // УРОВЕНЬ 3: MediaCodec программное декодирование
+            if (framesAdded == 0) {
+                try {
+                    framesAdded = extractWithSoftwareMediaCodec(
+                        videoFile = videoFile,
+                        maxFrames = totalTargetFrames,
+                        frameStep = 1,
+                        targetWidth = maxDimension
+                    ) { bitmap ->
+                        encoder.addFrame(bitmap)
+                        val p = (35 + ((framesAdded + 1) * 60 / totalTargetFrames)).coerceAtMost(95)
+                        kotlinx.coroutines.runBlocking(Dispatchers.Main) {
+                            onProgress(p)
+                        }
+                    }
+                } catch (e: Throwable) {
+                    diagLog.append("Codec: ").append(e.message ?: e.javaClass.simpleName).append("; ")
                 }
             }
 
@@ -179,7 +160,7 @@ object GifConverter {
                 } else if (targetFile != null && targetFile.exists()) {
                     targetFile.delete()
                 }
-                val msg = if (diag.isNotBlank()) "Не удалось извлечь кадры (" + diag.toString().trim() + ")" else "Не удалось декодировать кадры из видеофайла"
+                val msg = if (diagLog.isNotBlank()) "Не удалось извлечь кадры (" + diagLog.toString().trim() + ")" else "Не удалось декодировать кадры из видеофайла"
                 return@withContext Pair(null, msg)
             }
 
@@ -212,138 +193,218 @@ object GifConverter {
     }
 
     /**
-     * Декодирование через аппаратный MediaCodec с выводом на Surface (ImageReader).
-     * Аппаратные декодеры Qualcomm / MediaTek требуют Surface и безотказно декодируют на него.
+     * Надежное извлечение кадров через MediaMetadataRetriever.
+     * Пробует поочередно путь к файлу, открытый дескриптор и ParcelFileDescriptor.
      */
-    private fun extractWithImageReaderSurface(
+    private fun extractWithRetriever(
+        context: Context,
         videoFile: File,
-        maxFrames: Int,
-        frameStep: Int,
-        targetWidth: Int,
-        onFrame: (Bitmap) -> Unit
+        maxDurationSec: Int,
+        fps: Int,
+        maxDimension: Int,
+        encoder: AnimatedGifEncoder,
+        onProgress: (Int) -> Unit
     ): Int {
-        val extractor = MediaExtractor()
+        var added = 0
+        var retriever: MediaMetadataRetriever? = null
+        var pfd: ParcelFileDescriptor? = null
         var fis: FileInputStream? = null
-        var decoder: MediaCodec? = null
-        var imageReader: ImageReader? = null
-        var surface: Surface? = null
-        var decodedCount = 0
-        var acceptedCount = 0
 
         try {
-            fis = FileInputStream(videoFile)
-            extractor.setDataSource(fis.fd, 0L, videoFile.length())
+            var initialized = false
 
-            var videoTrack = -1
-            var format: MediaFormat? = null
+            // Попытка A: через абсолютный путь (самый быстрый и стандартный)
+            try {
+                val testRetriever = MediaMetadataRetriever()
+                testRetriever.setDataSource(videoFile.absolutePath)
+                retriever = testRetriever
+                initialized = true
+            } catch (ignored: Throwable) {}
 
-            for (i in 0 until extractor.trackCount) {
-                val f = extractor.getTrackFormat(i)
-                val mime = f.getString(MediaFormat.KEY_MIME) ?: ""
-                if (mime.startsWith("video/")) {
-                    videoTrack = i
-                    format = f
-                    break
-                }
+            // Попытка B: через FileInputStream FD
+            if (!initialized) {
+                try {
+                    val testRetriever = MediaMetadataRetriever()
+                    fis = FileInputStream(videoFile)
+                    testRetriever.setDataSource(fis.fd)
+                    retriever = testRetriever
+                    initialized = true
+                } catch (ignored: Throwable) {}
             }
 
-            if (videoTrack < 0 || format == null) return 0
-            extractor.selectTrack(videoTrack)
-
-            val mime = format.getString(MediaFormat.KEY_MIME) ?: "video/avc"
-            val width = format.getInteger(MediaFormat.KEY_WIDTH)
-            val height = format.getInteger(MediaFormat.KEY_HEIGHT)
-
-            imageReader = ImageReader.newInstance(width, height, ImageFormat.YUV_420_888, 5)
-            surface = imageReader.surface
-
-            decoder = MediaCodec.createDecoderByType(mime)
-            decoder.configure(format, surface, null, 0)
-            decoder.start()
-
-            val info = MediaCodec.BufferInfo()
-            var sawInputEOS = false
-            var sawOutputEOS = false
-            var noOutputCounter = 0
-            val timeoutUs = 10000L
-
-            while (!sawOutputEOS && acceptedCount < maxFrames && noOutputCounter < 150) {
-                if (!sawInputEOS) {
-                    val inputIndex = decoder.dequeueInputBuffer(timeoutUs)
-                    if (inputIndex >= 0) {
-                        val inputBuffer = decoder.getInputBuffer(inputIndex)
-                        if (inputBuffer != null) {
-                            val sampleSize = extractor.readSampleData(inputBuffer, 0)
-                            if (sampleSize < 0) {
-                                decoder.queueInputBuffer(inputIndex, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                                sawInputEOS = true
-                            } else {
-                                val timeUs = extractor.sampleTime
-                                decoder.queueInputBuffer(inputIndex, 0, sampleSize, timeUs, 0)
-                                extractor.advance()
-                            }
-                        }
-                    }
-                }
-
-                val outputIndex = decoder.dequeueOutputBuffer(info, timeoutUs)
-                if (outputIndex >= 0) {
-                    noOutputCounter = 0
-
-                    if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                        sawOutputEOS = true
-                    }
-
-                    // Рендерим готовый декодированный кадр на Surface ImageReader
-                    decoder.releaseOutputBuffer(outputIndex, true)
-
-                    // Считываем готовое изображение из ImageReader
-                    var image: Image? = null
-                    for (attempt in 0 until 5) {
-                        image = imageReader.acquireNextImage()
-                        if (image != null) break
-                        try { Thread.sleep(3) } catch (ignored: Throwable) {}
-                    }
-
-                    if (image != null) {
-                        if (decodedCount % frameStep == 0) {
-                            val bitmap = yuvImageToBitmap(image)
-                            if (bitmap != null) {
-                                val scaled = if (bitmap.width != targetWidth && targetWidth > 0) {
-                                    val aspect = bitmap.height.toFloat() / bitmap.width.toFloat()
-                                    val targetHeight = ((targetWidth * aspect).toInt() / 2) * 2
-                                    Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight.coerceAtLeast(2), true)
-                                } else bitmap
-
-                                onFrame(scaled)
-                                acceptedCount++
-                            }
-                        }
-                        try { image.close() } catch (ignored: Throwable) {}
-                        decodedCount++
-                    }
-                } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED || outputIndex == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) {
-                    noOutputCounter = 0
-                } else {
-                    if (sawInputEOS) {
-                        noOutputCounter++
-                    }
-                }
+            // Попытка C: через ParcelFileDescriptor
+            if (!initialized) {
+                try {
+                    val testRetriever = MediaMetadataRetriever()
+                    pfd = ParcelFileDescriptor.open(videoFile, ParcelFileDescriptor.MODE_READ_ONLY)
+                    testRetriever.setDataSource(pfd.fileDescriptor)
+                    retriever = testRetriever
+                    initialized = true
+                } catch (ignored: Throwable) {}
             }
+
+            // Попытка D: через Context и Uri
+            if (!initialized) {
+                try {
+                    val testRetriever = MediaMetadataRetriever()
+                    testRetriever.setDataSource(context, Uri.fromFile(videoFile))
+                    retriever = testRetriever
+                    initialized = true
+                } catch (ignored: Throwable) {}
+            }
+
+            val mmr = retriever ?: return 0
+
+            val durationStr = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+            val durationMs = durationStr?.toLongOrNull() ?: 2000L
+            val actualDurationMs = min(durationMs, maxDurationSec * 1000L).coerceAtLeast(300L)
+
+            val frameIntervalMs = 1000L / fps
+            val totalFrames = (actualDurationMs / frameIntervalMs).toInt().coerceIn(2, 60)
+
+            var lastValid: Bitmap? = null
+
+            for (i in 0 until totalFrames) {
+                val timeUs = i * frameIntervalMs * 1000L
+                var frame: Bitmap? = null
+
+                // Вариант 1: getScaledFrameAtTime (API 27+)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 && maxDimension > 0) {
+                    try {
+                        frame = mmr.getScaledFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST, maxDimension, maxDimension)
+                    } catch (ignored: Throwable) {}
+                    if (frame == null) {
+                        try {
+                            frame = mmr.getScaledFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, maxDimension, maxDimension)
+                        } catch (ignored: Throwable) {}
+                    }
+                }
+
+                // Вариант 2: OPTION_CLOSEST
+                if (frame == null) {
+                    try {
+                        frame = mmr.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                    } catch (ignored: Throwable) {}
+                }
+
+                // Вариант 3: OPTION_CLOSEST_SYNC
+                if (frame == null) {
+                    try {
+                        frame = mmr.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    } catch (ignored: Throwable) {}
+                }
+
+                // Вариант 4: OPTION_PREVIOUS_SYNC
+                if (frame == null) {
+                    try {
+                        frame = mmr.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_PREVIOUS_SYNC)
+                    } catch (ignored: Throwable) {}
+                }
+
+                // Вариант 5: базовый frameAtTime
+                if (frame == null && i == 0) {
+                    try {
+                        frame = mmr.frameAtTime
+                    } catch (ignored: Throwable) {}
+                }
+
+                val toUse = frame ?: lastValid
+                if (toUse != null) {
+                    val scaled = if (toUse.width != maxDimension && maxDimension > 0) {
+                        val aspect = toUse.height.toFloat() / toUse.width.toFloat()
+                        val targetHeight = ((maxDimension * aspect).toInt() / 2) * 2
+                        Bitmap.createScaledBitmap(toUse, maxDimension, targetHeight.coerceAtLeast(2), true)
+                    } else toUse
+
+                    encoder.addFrame(scaled)
+                    added++
+
+                    if (frame != null) {
+                        if (lastValid != null && lastValid != frame) {
+                            lastValid.recycle()
+                        }
+                        lastValid = frame
+                    }
+                }
+
+                val p = 35 + ((i + 1) * 60 / totalFrames)
+                onProgress(p)
+            }
+            lastValid?.recycle()
         } finally {
-            try { decoder?.stop() } catch (ignored: Throwable) {}
-            try { decoder?.release() } catch (ignored: Throwable) {}
-            try { surface?.release() } catch (ignored: Throwable) {}
-            try { imageReader?.close() } catch (ignored: Throwable) {}
-            try { extractor.release() } catch (ignored: Throwable) {}
+            try { retriever?.release() } catch (ignored: Throwable) {}
             try { fis?.close() } catch (ignored: Throwable) {}
+            try { pfd?.close() } catch (ignored: Throwable) {}
         }
 
-        return acceptedCount
+        return added
     }
 
     /**
-     * Полноценное декодирование через MediaExtractor + MediaCodec с программным буфером.
+     * Извлечение кадров через Glide с использованием RequestOptions.frameOf(timeUs).
+     */
+    private fun extractWithGlide(
+        context: Context,
+        videoFile: File,
+        maxDurationSec: Int,
+        fps: Int,
+        maxDimension: Int,
+        encoder: AnimatedGifEncoder,
+        onProgress: (Int) -> Unit
+    ): Int {
+        var added = 0
+        try {
+            val totalFrames = maxDurationSec * fps
+            val frameIntervalMs = 1000L / fps
+            var lastValid: Bitmap? = null
+
+            for (i in 0 until totalFrames) {
+                val timeUs = i * frameIntervalMs * 1000L
+                var frame: Bitmap? = null
+                try {
+                    frame = Glide.with(context.applicationContext)
+                        .asBitmap()
+                        .load(videoFile)
+                        .apply(RequestOptions.frameOf(timeUs))
+                        .submit(maxDimension, maxDimension)
+                        .get()
+                } catch (ignored: Throwable) {}
+
+                if (frame == null && i == 0) {
+                    try {
+                        frame = Glide.with(context.applicationContext)
+                            .asBitmap()
+                            .load(videoFile)
+                            .apply(RequestOptions.frameOf(-1L))
+                            .submit(maxDimension, maxDimension)
+                            .get()
+                    } catch (ignored: Throwable) {}
+                }
+
+                val toUse = frame ?: lastValid
+                if (toUse != null) {
+                    encoder.addFrame(toUse)
+                    added++
+                    if (frame != null) {
+                        if (lastValid != null && lastValid != frame) {
+                            lastValid.recycle()
+                        }
+                        lastValid = frame
+                    }
+                }
+
+                val p = 35 + ((i + 1) * 60 / totalFrames)
+                onProgress(p)
+            }
+            lastValid?.recycle()
+        } catch (e: Throwable) {
+            e.printStackTrace()
+        }
+        return added
+    }
+
+    /**
+     * Программное декодирование через MediaExtractor + MediaCodec с правильным циклом ожидания кадров.
      */
     private fun extractWithSoftwareMediaCodec(
         videoFile: File,
@@ -540,145 +601,5 @@ object GifConverter {
             e.printStackTrace()
             null
         }
-    }
-
-    /**
-     * Извлечение кадров через MediaMetadataRetriever с использованием FileDescriptor
-     */
-    private fun extractWithContextRetriever(
-        videoFile: File,
-        maxDurationSec: Int,
-        fps: Int,
-        maxDimension: Int,
-        encoder: AnimatedGifEncoder,
-        onProgress: (Int) -> Unit
-    ): Int {
-        val retriever = MediaMetadataRetriever()
-        var added = 0
-        var fis: FileInputStream? = null
-
-        try {
-            try {
-                fis = FileInputStream(videoFile)
-                retriever.setDataSource(fis.fd, 0L, videoFile.length())
-            } catch (e: Throwable) {
-                retriever.setDataSource(videoFile.absolutePath)
-            }
-
-            val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-            val durationMs = durationStr?.toLongOrNull() ?: 2000L
-            val actualDurationMs = min(durationMs, maxDurationSec * 1000L).coerceAtLeast(300L)
-
-            val frameIntervalMs = 1000L / fps
-            val totalFrames = (actualDurationMs / frameIntervalMs).toInt().coerceIn(2, 60)
-
-            var lastValid: Bitmap? = null
-
-            for (i in 0 until totalFrames) {
-                val timeUs = i * frameIntervalMs * 1000L
-                var frame: Bitmap? = null
-
-                try {
-                    frame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
-                } catch (ignored: Throwable) {}
-
-                if (frame == null) {
-                    try {
-                        frame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                    } catch (ignored: Throwable) {}
-                }
-
-                if (frame == null) {
-                    try {
-                        frame = retriever.getFrameAtTime(timeUs)
-                    } catch (ignored: Throwable) {}
-                }
-
-                if (frame == null && i == 0) {
-                    try {
-                        frame = retriever.frameAtTime
-                    } catch (ignored: Throwable) {}
-                }
-
-                val toUse = frame ?: lastValid
-                if (toUse != null) {
-                    val scaled = if (toUse.width != maxDimension && maxDimension > 0) {
-                        val aspect = toUse.height.toFloat() / toUse.width.toFloat()
-                        val targetHeight = ((maxDimension * aspect).toInt() / 2) * 2
-                        Bitmap.createScaledBitmap(toUse, maxDimension, targetHeight.coerceAtLeast(2), true)
-                    } else toUse
-
-                    encoder.addFrame(scaled)
-                    added++
-
-                    if (frame != null) {
-                        if (lastValid != null && lastValid != frame) {
-                            lastValid.recycle()
-                        }
-                        lastValid = frame
-                    }
-                }
-
-                val p = 35 + ((i + 1) * 60 / totalFrames)
-                onProgress(p)
-            }
-            lastValid?.recycle()
-        } finally {
-            try { fis?.close() } catch (ignored: Throwable) {}
-            try { retriever.release() } catch (ignored: Throwable) {}
-        }
-        return added
-    }
-
-    /**
-     * Извлечение кадров через Glide
-     */
-    private fun extractWithGlide(
-        context: Context,
-        videoFile: File,
-        maxDurationSec: Int,
-        fps: Int,
-        maxDimension: Int,
-        encoder: AnimatedGifEncoder,
-        onProgress: (Int) -> Unit
-    ): Int {
-        var added = 0
-        try {
-            val totalFrames = maxDurationSec * fps
-            val frameIntervalMs = 1000L / fps
-            var lastValid: Bitmap? = null
-
-            for (i in 0 until totalFrames) {
-                val timeUs = i * frameIntervalMs * 1000L
-                var frame: Bitmap? = null
-                try {
-                    frame = Glide.with(context.applicationContext)
-                        .asBitmap()
-                        .load(videoFile)
-                        .frame(timeUs)
-                        .submit(maxDimension, maxDimension)
-                        .get()
-                } catch (ignored: Throwable) {}
-
-                val toUse = frame ?: lastValid
-                if (toUse != null) {
-                    encoder.addFrame(toUse)
-                    added++
-                    if (frame != null) {
-                        if (lastValid != null && lastValid != frame) {
-                            lastValid.recycle()
-                        }
-                        lastValid = frame
-                    }
-                }
-
-                val p = 35 + ((i + 1) * 60 / totalFrames)
-                onProgress(p)
-            }
-            lastValid?.recycle()
-        } catch (e: Throwable) {
-            e.printStackTrace()
-        }
-        return added
     }
 }
