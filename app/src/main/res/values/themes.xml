@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.XDownloader" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/primary</item>
+        <item name="android:statusBarColor">@color/background_dark</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+
+    <style name="ShapeAppearance.XDownloader.Logo" parent="ShapeAppearance.Material3.Corner.Full">
+        <item name="cornerSize">14dp</item>
+    </style>
+
+    <style name="ShapeAppearance.XDownloader.Input" parent="ShapeAppearance.Material3.Corner.Full">
+        <item name="cornerSize">14dp</item>
+    </style>
+</resources>

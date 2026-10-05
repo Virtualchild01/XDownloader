@@ -1,0 +1,4 @@
+-keep class com.example.xdownloader.api.** { *; }
+-dontwarn okhttp3.**
+-dontwarn okio.**
+-dontwarn com.google.gson.**

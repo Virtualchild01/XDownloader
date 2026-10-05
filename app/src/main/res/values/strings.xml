@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">XDownloader</string>
+    <string name="hint_enter_url">Вставьте ссылку на пост X / Twitter...</string>
+    <string name="btn_paste">Вставить</string>
+    <string name="btn_find">Найти медиа</string>
+    <string name="btn_download">Скачать</string>
+    <string name="select_format_title">Выберите формат:</string>
+    <string name="support_developer">Поддержать автора (CloudTips)</string>
+    <string name="dialog_support_title">Поддержка разработчика ❤️</string>
+    <string name="dialog_support_message">XDownloader бесплатен и развивается благодаря вашей поддержке! Вы можете отправить любую сумму через сервис CloudTips:</string>
+    <string name="btn_open_link">Перейти к оплате</string>
+    <string name="btn_close">Закрыть</string>
+    <string name="toast_empty_url">Пожалуйста, вставьте ссылку на пост из сети X</string>
+    <string name="toast_download_started">Загрузка запущена! Проверьте шторку уведомлений.</string>
+    <string name="toast_gif_saved">Анимированный GIF сохранён в папку «Загрузки»!</string>
+    <string name="toast_error">Ошибка получения данных: %1$s</string>
+    <string name="badge_gif">GIF</string>
+    <string name="badge_video">ВИДЕО</string>
+    <string name="badge_photo">ФОТО</string>
+</resources>
