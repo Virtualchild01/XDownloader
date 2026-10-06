@@ -283,15 +283,13 @@ object GifConverter {
      */
     private fun jcodecPictureToBitmap(src: Picture): Bitmap? {
         return try {
-            val cleanPic = if (src.crop != null) src.createCropped() else src
-
             val rgbPic: Picture
-            if (cleanPic.color == ColorSpace.RGB) {
-                rgbPic = cleanPic
+            if (src.color == ColorSpace.RGB) {
+                rgbPic = src
             } else {
-                val transform = ColorUtil.getTransform(cleanPic.color, ColorSpace.RGB)
-                rgbPic = Picture.create(cleanPic.width, cleanPic.height, ColorSpace.RGB)
-                transform.transform(cleanPic, rgbPic)
+                val transform = ColorUtil.getTransform(src.color, ColorSpace.RGB)
+                rgbPic = Picture.create(src.width, src.height, ColorSpace.RGB)
+                transform.transform(src, rgbPic)
             }
 
             val w = rgbPic.width
