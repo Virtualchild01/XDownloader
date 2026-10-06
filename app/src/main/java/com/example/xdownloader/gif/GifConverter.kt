@@ -13,7 +13,6 @@ import com.bumptech.glide.Glide
 import com.bumptech.glide.request.RequestOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.jcodec.android.AndroidUtil
 import org.jcodec.api.FrameGrab
 import org.jcodec.common.io.NIOUtils
 import org.jcodec.common.io.SeekableByteChannel
@@ -286,13 +285,6 @@ object GifConverter {
         return try {
             val cleanPic = if (src.crop != null) src.createCropped() else src
 
-            // 1. Официальный конвертер JCodec для Android
-            try {
-                val bmp = AndroidUtil.toBitmap(cleanPic)
-                if (bmp != null) return bmp
-            } catch (ignored: Throwable) {}
-
-            // 2. Резервный конвертер с правильным преобразованием YUV -> RGB (без затемнения)
             val rgbPic: Picture
             if (cleanPic.color == ColorSpace.RGB) {
                 rgbPic = cleanPic
