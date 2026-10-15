@@ -11,49 +11,53 @@ android {
         applicationId = "com.example.xdownloader"
         minSdk = 24
         targetSdk = 34
-        versionCode = (project.findProperty("versionCode") as? String)?.toIntOrNull() ?: 38
-        versionName = "1.0.${(project.findProperty("versionCode") as? String) ?: "38"}"
+
+        val envVersionCode = System.getenv("APP_VERSION_CODE")?.toIntOrNull()
+        val envVersionName = System.getenv("APP_VERSION_NAME")
+
+        versionCode = envVersionCode ?: 39
+        versionName = if (!envVersionName.isNullOrBlank()) envVersionName else "1.0.39"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     signingConfigs {
-        getByName("debug") {
-            storeFile = file("debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
-        }
-    }
-
-    packaging {
-        resources {
-            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        create("release") {
+            val keystorePath = System.getenv("KEYSTORE_PATH")
+            if (!keystorePath.isNullOrBlank() && file(keystorePath).exists()) {
+                storeFile = file(keystorePath)
+                storePassword = System.getenv("KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("KEY_ALIAS")
+                keyPassword = System.getenv("KEY_PASSWORD")
+            }
         }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            val keystorePath = System.getenv("KEYSTORE_PATH")
+            if (!keystorePath.isNullOrBlank() && file(keystorePath).exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            } else {
+                signingConfig = signingConfigs.getByName("debug")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
         }
-        debug {
-            isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
-        }
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
+
     kotlinOptions {
-        jvmTarget = "1.8"
+        jvmTarget = "17"
     }
+
     buildFeatures {
         viewBinding = true
     }
@@ -65,19 +69,13 @@ dependencies {
     implementation("com.google.android.material:material:1.11.0")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
-
-    // Asynchronous network operations
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
-    // HTTP client
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-
-    // JSON parsing
     implementation("com.google.code.gson:gson:2.10.1")
-
-    // Image loading for thumbnails and photos
     implementation("com.github.bumptech.glide:glide:4.16.0")
 
-    // Pure Java H.264 / MP4 frame extractor (100% device & OEM independent)
+    // Автономный программный декодер MP4/H.264 для конвертации в GIF
     implementation("org.jcodec:jcodec:0.2.5")
+    implementation("org.jcodec:jcodec-android:0.2.5")
 }

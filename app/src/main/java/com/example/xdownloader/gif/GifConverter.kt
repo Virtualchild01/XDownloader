@@ -14,6 +14,8 @@ import com.bumptech.glide.Glide
 import com.bumptech.glide.request.RequestOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import org.jcodec.api.FrameGrab
 import org.jcodec.common.io.NIOUtils
 import org.jcodec.common.io.SeekableByteChannel
@@ -27,41 +29,101 @@ import java.io.FileOutputStream
 import java.io.OutputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
-import java.util.Arrays
 import java.util.TreeMap
+import java.util.concurrent.TimeUnit
+import kotlin.math.max
 import kotlin.math.min
 
 object GifConverter {
 
-    data class Mp4TrackMeta(
-        val durationMs: Long,
-        val videoFrames: Int,
-        val displayRank: IntArray
-    )
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .build()
 
     /**
-     * Converts a local MP4 video file into an animated GIF.
-     * Reorders H.264 B-frames from Decode Order (DTS) into strict Presentation Order (PTS)
-     * using MP4 'stts' + 'ctts' tables, eliminating frame jumping/stuttering.
-     * @return Pair of (Uri?, errorMessage?)
+     * Пропорциональное масштабирование кадра под выбранный режим (0 = Оригинал, 720 = HD 720p по короткой стороне).
      */
-    suspend fun convertVideoToGif(
+    private fun scaleBitmapIfNeeded(bitmap: Bitmap, targetShortSide: Int): Bitmap {
+        if (targetShortSide <= 0) return bitmap
+        val w = bitmap.width
+        val h = bitmap.height
+        val minSide = min(w, h)
+        val maxSide = max(w, h)
+        if (minSide <= targetShortSide && maxSide <= 1280) return bitmap
+
+        val scale = min(targetShortSide.toFloat() / minSide.toFloat(), 1280f / maxSide.toFloat()).coerceAtMost(1.0f)
+        val newW = (((w * scale).toInt() + 1) / 2 * 2).coerceAtLeast(2)
+        val newH = (((h * scale).toInt() + 1) / 2 * 2).coerceAtLeast(2)
+        if (newW == w && newH == h) return bitmap
+
+        val scaled = Bitmap.createScaledBitmap(bitmap, newW, newH, true)
+        if (scaled != bitmap) bitmap.recycle()
+        return scaled
+    }
+
+    /**
+     * Скачивает исходный видеофайл во временный кэш, извлекает кадры в строгом хронологическом порядке (PTS)
+     * и сохраняет анимированный .gif в папку "Загрузки".
+     */
+    suspend fun convertVideoUrlToGif(
+        context: Context,
+        videoUrl: String,
+        targetTitle: String,
+        expectedDurationMs: Long = 0L,
+        maxDurationSec: Int = 10,
+        fps: Int = 15,
+        maxDimension: Int = 0, // 0 = оригинальное разрешение видео, 720 = HD 720p
+        onProgress: (Int) -> Unit
+    ): Pair<Uri?, String?> = withContext(Dispatchers.IO) {
+        var tempVideoFile: File? = null
+        try {
+            withContext(Dispatchers.Main) {
+                onProgress(5)
+            }
+
+            tempVideoFile = downloadTempVideo(context, videoUrl) { downloadProg ->
+                val mapped = 5 + (downloadProg * 25 / 100)
+                kotlinx.coroutines.runBlocking(Dispatchers.Main) {
+                    onProgress(mapped)
+                }
+            }
+
+            if (tempVideoFile == null || !tempVideoFile.exists() || tempVideoFile.length() < 512L) {
+                return@withContext Pair(null, "Не удалось скачать исходное видео с сервера X")
+            }
+
+            convertLocalVideoToGif(
+                context = context,
+                videoFile = tempVideoFile,
+                targetTitle = targetTitle,
+                expectedDurationMs = expectedDurationMs,
+                maxDurationSec = maxDurationSec,
+                fps = fps,
+                maxDimension = maxDimension,
+                onProgress = onProgress
+            )
+        } catch (e: Throwable) {
+            e.printStackTrace()
+            Pair(null, e.message ?: e.javaClass.simpleName)
+        } finally {
+            try {
+                tempVideoFile?.delete()
+            } catch (ignored: Throwable) {}
+        }
+    }
+
+    suspend fun convertLocalVideoToGif(
         context: Context,
         videoFile: File,
         targetTitle: String,
         expectedDurationMs: Long = 0L,
-        maxDurationSec: Int = 12,
-        fps: Int = 24,
+        maxDurationSec: Int = 10,
+        fps: Int = 15,
         maxDimension: Int = 0,
         onProgress: (Int) -> Unit
     ): Pair<Uri?, String?> = withContext(Dispatchers.IO) {
-        if (!videoFile.exists() || !videoFile.canRead() || videoFile.length() < 1000L) {
-            return@withContext Pair(null, "Видеофайл пуст или не прочитан (" + videoFile.length() + " байт)")
-        }
-
-        try {
-            videoFile.setReadable(true, false)
-        } catch (ignored: Throwable) {}
 
         withContext(Dispatchers.Main) {
             onProgress(35)
@@ -170,38 +232,38 @@ object GifConverter {
                         }
                     }
                 } catch (e: Throwable) {
-                    diagLog.append("Glide: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+                    diagLog.append("Glide: ").append(e.message ?: e.javaClass.simpleName)
                 }
-            }
-
-            if (framesAdded == 0) {
-                try { bufferedOut.close() } catch (ignored: Throwable) {}
-                if (outputUri != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    try { context.contentResolver.delete(outputUri, null, null) } catch (ignored: Throwable) {}
-                } else if (targetFile != null && targetFile.exists()) {
-                    targetFile.delete()
-                }
-                val msg = if (diagLog.isNotBlank()) {
-                    "Сбой декодирования (" + diagLog.toString().trim() + ", размер: " + videoFile.length() + " Б)"
-                } else {
-                    "Не удалось извлечь кадры из видеофайла (размер: " + videoFile.length() + " Б)"
-                }
-                return@withContext Pair(null, msg)
             }
 
             encoder.finish()
             bufferedOut.flush()
             bufferedOut.close()
+            bufferedOut = null
+            rawOutStream = null
+
+            if (framesAdded == 0) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && outputUri != null) {
+                    try { context.contentResolver.delete(outputUri, null, null) } catch (ignored: Throwable) {}
+                } else {
+                    targetFile?.delete()
+                }
+                val details = diagLog.toString().ifEmpty { "Не удалось декодировать кадры видео" }
+                return@withContext Pair(null, details)
+            }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && outputUri != null) {
-                val updateValues = ContentValues().apply {
+                val values = ContentValues().apply {
                     put(MediaStore.MediaColumns.IS_PENDING, 0)
                 }
-                context.contentResolver.update(outputUri, updateValues, null, null)
+                context.contentResolver.update(outputUri, values, null, null)
             } else if (targetFile != null) {
-                try {
-                    MediaScannerConnection.scanFile(context, arrayOf(targetFile.absolutePath), arrayOf("image/gif"), null)
-                } catch (ignored: Throwable) {}
+                MediaScannerConnection.scanFile(
+                    context,
+                    arrayOf(targetFile.absolutePath),
+                    arrayOf("image/gif"),
+                    null
+                )
             }
 
             withContext(Dispatchers.Main) {
@@ -209,26 +271,33 @@ object GifConverter {
             }
 
             Pair(outputUri, null)
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             e.printStackTrace()
             try { bufferedOut?.close() } catch (ignored: Throwable) {}
-            if (outputUri != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try { rawOutStream?.close() } catch (ignored: Throwable) {}
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && outputUri != null) {
                 try { context.contentResolver.delete(outputUri, null, null) } catch (ignored: Throwable) {}
-            } else if (targetFile != null && targetFile.exists()) {
-                targetFile.delete()
+            } else {
+                try { targetFile?.delete() } catch (ignored: Throwable) {}
             }
-            Pair(null, e.message ?: "Сбой при конвертации")
+            Pair(null, e.message ?: e.javaClass.simpleName)
         }
     }
 
     /**
-     * Прямое бинарное чтение метаданных MP4-файла из атомов:
-     * - 'mvhd': общая длительность ролика в миллисекундах
-     * - 'stsz' (внутри видеотрека 'vide'): точное количество видеокадров
-     * - 'stts' + 'ctts' (внутри 'vide'): вычисление PTS = DTS + CTTS каждого кадра
-     *   для восстановления строгого хронологического порядка кадров при наличии B-frames!
+     * Метаданные видеодорожки MP4:
+     * - durationMs: точная длительность из mvhd
+     * - videoFrames: общее число видеокадров из stsz
+     * - displayRank: массив отображения decodeIndex (DTS) -> displayOrder (PTS, 0..N-1).
+     *   Исправляет рывки и скачки назад во времени на H.264 видео с B-кадрами!
      */
-    fun parseMp4Meta(videoFile: File): Mp4TrackMeta {
+    private class Mp4TrackMeta(
+        val durationMs: Long,
+        val videoFrames: Int,
+        val displayRank: IntArray
+    )
+
+    private fun parseMp4Meta(videoFile: File): Mp4TrackMeta {
         var durationMs = 0L
         var videoFrames = 0
         var displayRank = IntArray(0)
@@ -237,9 +306,7 @@ object GifConverter {
         try {
             raf = RandomAccessFile(videoFile, "r")
             val len = raf.length()
-            if (len < 48L) return Mp4TrackMeta(0L, 0, displayRank)
-
-            val chunkSize = min(len, 2L * 1024L * 1024L).toInt()
+            val chunkSize = min(len, 1024 * 1024L).toInt()
             val buf = ByteArray(chunkSize)
 
             for (pass in 0 until 2) {
@@ -309,70 +376,63 @@ object GifConverter {
                 }
 
                 if (videoFrames > 0) {
-                    val dts = LongArray(videoFrames)
+                    val n = videoFrames.coerceAtMost(10000)
+                    val dts = LongArray(n)
                     if (sttsPos != -1 && sttsPos + 12 <= read) {
                         val entryCount = bb.getInt(sttsPos + 8)
-                        var pos = sttsPos + 12
+                        var p = sttsPos + 12
                         var sampleIdx = 0
                         var curDts = 0L
-                        var e = 0
-                        while (e < entryCount && pos + 8 <= read && sampleIdx < videoFrames) {
-                            val sc = bb.getInt(pos)
-                            val delta = bb.getInt(pos + 4).toLong()
-                            pos += 8
-                            var k = 0
-                            while (k < sc && sampleIdx < videoFrames) {
-                                dts[sampleIdx++] = curDts
-                                curDts += delta
-                                k++
+                        if (entryCount in 1..20000) {
+                            for (e in 0 until entryCount) {
+                                if (p + 8 > read || sampleIdx >= n) break
+                                val cnt = bb.getInt(p)
+                                val delta = bb.getInt(p + 4).toLong()
+                                p += 8
+                                if (cnt <= 0 || cnt > 100000) break
+                                for (k in 0 until cnt) {
+                                    if (sampleIdx >= n) break
+                                    dts[sampleIdx++] = curDts
+                                    curDts += delta
+                                }
                             }
-                            e++
                         }
                     } else {
-                        for (idx in 0 until videoFrames) dts[idx] = idx * 1000L
+                        for (idx in 0 until n) dts[idx] = idx * 1000L
                     }
 
-                    val pts = LongArray(videoFrames)
-                    for (idx in 0 until videoFrames) pts[idx] = dts[idx]
-
+                    val ctts = LongArray(n)
                     if (cttsPos != -1 && cttsPos + 12 <= read) {
                         val entryCount = bb.getInt(cttsPos + 8)
-                        var pos = cttsPos + 12
+                        var p = cttsPos + 12
                         var sampleIdx = 0
-                        var e = 0
-                        while (e < entryCount && pos + 8 <= read && sampleIdx < videoFrames) {
-                            val sc = bb.getInt(pos)
-                            val offset = bb.getInt(pos + 4).toLong()
-                            pos += 8
-                            var k = 0
-                            while (k < sc && sampleIdx < videoFrames) {
-                                pts[sampleIdx] += offset
-                                sampleIdx++
-                                k++
+                        if (entryCount in 1..20000) {
+                            for (e in 0 until entryCount) {
+                                if (p + 8 > read || sampleIdx >= n) break
+                                val cnt = bb.getInt(p)
+                                val offset = bb.getInt(p + 4).toLong()
+                                p += 8
+                                if (cnt <= 0 || cnt > 100000) break
+                                for (k in 0 until cnt) {
+                                    if (sampleIdx >= n) break
+                                    ctts[sampleIdx++] = offset
+                                }
                             }
-                            e++
                         }
                     }
 
-                    // Сортируем индексы сэмплов по возрастанию PTS = DTS + CTTS:
-                    // упаковываем (ptsNormalized shl 20) | decodeIdx в LongArray для быстрой сортировки без аллокаций
-                    var minPts = Long.MAX_VALUE
-                    for (p in pts) {
-                        if (p < minPts) minPts = p
-                    }
-                    val packedPts = LongArray(videoFrames)
-                    for (idx in 0 until videoFrames) {
-                        val normPts = (pts[idx] - minPts).coerceAtLeast(0L)
-                        packedPts[idx] = (normPts shl 20) or (idx.toLong() and 0xFFFFFL)
-                    }
-                    Arrays.sort(packedPts)
+                    // Сортируем индексы декодирования по реальному времени показа PTS = DTS + CTTS
+                    val boxedOrder = Array(n) { it }
+                    boxedOrder.sortWith(Comparator { a, b ->
+                        val ptsA = dts[a] + ctts[a]
+                        val ptsB = dts[b] + ctts[b]
+                        val cmp = ptsA.compareTo(ptsB)
+                        if (cmp != 0) cmp else a.compareTo(b)
+                    })
 
-                    displayRank = IntArray(videoFrames)
-                    for (rank in 0 until videoFrames) {
-                        val decodeIdx = (packedPts[rank] and 0xFFFFFL).toInt()
-                        if (decodeIdx in 0 until videoFrames) {
-                            displayRank[decodeIdx] = rank
-                        }
+                    displayRank = IntArray(n)
+                    for (dispPos in 0 until n) {
+                        displayRank[boxedOrder[dispPos]] = dispPos
                     }
                 }
 
@@ -459,14 +519,7 @@ object GifConverter {
                             val gifOrder = dispIdx / step
                             val bitmap = jcodecPictureToBitmap(pic)
                             if (bitmap != null) {
-                                val finalBmp = if (targetWidth > 0 && bitmap.width > targetWidth) {
-                                    val aspect = bitmap.height.toFloat() / bitmap.width.toFloat()
-                                    val targetHeight = ((targetWidth * aspect).toInt() / 2) * 2
-                                    val s = Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight.coerceAtLeast(2), true)
-                                    if (s != bitmap) bitmap.recycle()
-                                    s
-                                } else bitmap
-
+                                val finalBmp = scaleBitmapIfNeeded(bitmap, targetWidth)
                                 val prev = reorderBuffer.put(gifOrder, finalBmp)
                                 prev?.recycle()
                             }
@@ -538,13 +591,7 @@ object GifConverter {
                     val pic: Picture = grab.nativeFrame ?: break
                     val bitmap = jcodecPictureToBitmap(pic)
                     if (bitmap != null) {
-                        val finalBmp = if (targetWidth > 0 && bitmap.width > targetWidth) {
-                            val aspect = bitmap.height.toFloat() / bitmap.width.toFloat()
-                            val targetHeight = ((targetWidth * aspect).toInt() / 2) * 2
-                            val s = Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight.coerceAtLeast(2), true)
-                            if (s != bitmap) bitmap.recycle()
-                            s
-                        } else bitmap
+                        val finalBmp = scaleBitmapIfNeeded(bitmap, targetWidth)
                         decodedBitmaps.add(finalBmp)
                     }
                     readCount++
@@ -770,11 +817,8 @@ object GifConverter {
 
                 val toUse = frame ?: lastValid
                 if (toUse != null) {
-                    val scaled = if (maxDimension > 0 && toUse.width > maxDimension) {
-                        val aspect = toUse.height.toFloat() / toUse.width.toFloat()
-                        val targetHeight = ((maxDimension * aspect).toInt() / 2) * 2
-                        Bitmap.createScaledBitmap(toUse, maxDimension, targetHeight.coerceAtLeast(2), true)
-                    } else toUse
+                    val copy = toUse.copy(Bitmap.Config.ARGB_8888, false)
+                    val scaled = scaleBitmapIfNeeded(copy, maxDimension)
 
                     val startCs = Math.round((i * actualDurationMs) / (10.0 * totalFrames)).toInt()
                     val endCs = Math.round(((i + 1) * actualDurationMs) / (10.0 * totalFrames)).toInt()
@@ -782,7 +826,7 @@ object GifConverter {
                     encoder.setDelay(delayCs * 10)
 
                     encoder.addFrame(scaled)
-                    if (scaled != toUse) scaled.recycle()
+                    scaled.recycle()
                     added++
 
                     if (frame != null) {
@@ -871,5 +915,44 @@ object GifConverter {
             e.printStackTrace()
         }
         return added
+    }
+
+    private fun downloadTempVideo(
+        context: Context,
+        videoUrl: String,
+        onDownloadProgress: (Int) -> Unit
+    ): File? {
+        val request = Request.Builder()
+            .url(videoUrl)
+            .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/122.0.0.0 Mobile Safari/537.36")
+            .build()
+
+        val tempFile = File(context.cacheDir, "temp_x_gif_${System.currentTimeMillis()}.mp4")
+        httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) return null
+            val body = response.body ?: return null
+            val contentLength = body.contentLength()
+            body.byteStream().use { input ->
+                FileOutputStream(tempFile).use { output ->
+                    val buffer = ByteArray(16 * 1024)
+                    var bytesRead: Int
+                    var totalRead = 0L
+                    var lastReported = -1
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        output.write(buffer, 0, bytesRead)
+                        totalRead += bytesRead
+                        if (contentLength > 0) {
+                            val prog = ((totalRead * 100) / contentLength).toInt().coerceIn(0, 100)
+                            if (prog != lastReported) {
+                                lastReported = prog
+                                onDownloadProgress(prog)
+                            }
+                        }
+                    }
+                    output.flush()
+                }
+            }
+        }
+        return tempFile
     }
 }

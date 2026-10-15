@@ -7,11 +7,18 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.database.Cursor
 import android.graphics.Color
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
+import android.text.style.RelativeSizeSpan
+import android.text.style.StyleSpan
 import android.view.View
 import android.widget.RadioButton
 import android.widget.Toast
@@ -88,6 +95,11 @@ class MainActivity : AppCompatActivity() {
         intent?.let { handleIncomingIntent(it) }
     }
 
+    override fun onDestroy() {
+        downloadMonitorJob?.cancel()
+        super.onDestroy()
+    }
+
     private fun applySavedTheme() {
         when (prefs.getInt(KEY_THEME, THEME_AUTO)) {
             THEME_DARK -> AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES)
@@ -124,6 +136,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupListeners() {
+        // Paste button
         binding.btnPaste.setOnClickListener {
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             val clip = clipboard.primaryClip
@@ -138,6 +151,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // Find media button
         binding.btnFind.setOnClickListener {
             val url = binding.etUrl.text?.toString()?.trim() ?: ""
             if (url.isEmpty()) {
@@ -147,10 +161,12 @@ class MainActivity : AppCompatActivity() {
             fetchPostMedia(url)
         }
 
+        // Download button
         binding.btnDownload.setOnClickListener {
             checkPermissionsAndDownload()
         }
 
+        // Action: Open Downloads / Gallery
         binding.btnViewVideo.setOnClickListener {
             val uri = lastSavedFileUri
             if (uri != null) {
@@ -166,6 +182,7 @@ class MainActivity : AppCompatActivity() {
             openDownloadsFolder()
         }
 
+        // Action: Share link or downloaded file
         binding.btnShare.setOnClickListener {
             val uri = lastSavedFileUri
             if (uri != null) {
@@ -190,6 +207,7 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent.createChooser(shareIntent, "Поделиться ссылкой"))
         }
 
+        // Support Developer buttons
         binding.btnSupport.setOnClickListener {
             showSupportDialog()
         }
@@ -248,6 +266,7 @@ class MainActivity : AppCompatActivity() {
         selectedMediaItem = firstMedia
         lastSavedFileUri = null
 
+        // Badge styling
         when (firstMedia.type) {
             XMediaType.GIF -> {
                 binding.tvBadgeType.text = getString(R.string.badge_gif)
@@ -263,13 +282,16 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // Load preview
         Glide.with(this)
             .load(firstMedia.previewUrl)
             .placeholder(android.R.drawable.ic_menu_gallery)
             .into(binding.ivPreview)
 
+        // Setup format options
         populateFormats(firstMedia.availableFormats)
 
+        // Reset status below action buttons
         binding.layoutStatus.visibility = View.GONE
         binding.progressDownload.visibility = View.GONE
         binding.tvStatus.text = ""
@@ -277,14 +299,61 @@ class MainActivity : AppCompatActivity() {
         binding.cardResult.visibility = View.VISIBLE
     }
 
+    /**
+     * Форматирует строку варианта: основное имя формата делается полужирным,
+     * а скобки с качеством и разрешением — аккуратным вторичным оттенком чуть меньшего размера.
+     */
+    private fun formatRadioLabel(rawLabel: String): CharSequence {
+        val parenIdx = rawLabel.indexOf('(')
+        if (parenIdx <= 0) return rawLabel
+        val spannable = SpannableString(rawLabel)
+        spannable.setSpan(
+            StyleSpan(Typeface.BOLD),
+            0,
+            parenIdx,
+            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+        )
+        spannable.setSpan(
+            ForegroundColorSpan(ContextCompat.getColor(this, R.color.text_secondary)),
+            parenIdx,
+            rawLabel.length,
+            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+        )
+        spannable.setSpan(
+            RelativeSizeSpan(0.92f),
+            parenIdx,
+            rawLabel.length,
+            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+        )
+        return spannable
+    }
+
     private fun populateFormats(formats: List<XFormatOption>) {
         binding.rgFormats.removeAllViews()
+        val density = resources.displayMetrics.density
+        val padV = (5 * density).toInt()
+        val padH = (6 * density).toInt()
+
+        val tintList = ColorStateList(
+            arrayOf(
+                intArrayOf(android.R.attr.state_checked),
+                intArrayOf(-android.R.attr.state_checked)
+            ),
+            intArrayOf(
+                ContextCompat.getColor(this, R.color.primary),
+                ContextCompat.getColor(this, R.color.text_secondary)
+            )
+        )
 
         for ((index, format) in formats.withIndex()) {
             val rb = RadioButton(this).apply {
                 id = View.generateViewId()
-                text = format.label
+                text = formatRadioLabel(format.label)
                 setTextColor(ContextCompat.getColor(context, R.color.text_primary))
+                textSize = 14.5f
+                buttonTintList = tintList
+                setPadding(padH, padV, padH, padV)
+                maxLines = 1
                 tag = format
                 isChecked = (index == 0)
             }
@@ -308,6 +377,11 @@ class MainActivity : AppCompatActivity() {
         if (format.isGifConversion) {
             binding.tvGifNotice.visibility = View.VISIBLE
             binding.btnDownload.text = "Скачать как GIF"
+            binding.tvGifNotice.text = if (format.targetGifMaxDim > 0) {
+                "💡 GIF (HD 720p): оптимальное HD-разрешение — конвертируется быстрее и весит в несколько раз меньше (удобно для Telegram и соцсетей)."
+            } else {
+                "💡 GIF (Оригинал): сохраняет зацикленную анимацию .gif в полном исходном разрешении видео без сжатия размеров."
+            }
         } else {
             binding.tvGifNotice.visibility = View.GONE
             binding.btnDownload.text = getString(R.string.btn_download)
@@ -403,6 +477,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Отслеживает статус системного DownloadManager в реальном времени,
+     * обновляет прогресс-бар и меняет статус на «Готово!» сразу после завершения скачивания.
+     */
     private fun trackDownloadProgress(downloadId: Long, mimeType: String) {
         val downloadManager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
 
@@ -459,6 +537,7 @@ class MainActivity : AppCompatActivity() {
                             }
                         }
                     } else {
+                        // Загрузка была отменена пользователем или удалена из очереди
                         isFinished = true
                         withContext(Dispatchers.Main) {
                             binding.progressDownload.visibility = View.GONE

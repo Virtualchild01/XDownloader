@@ -8,6 +8,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
+import kotlin.math.max
+import kotlin.math.min
 
 class XApiService {
 
@@ -18,6 +20,7 @@ class XApiService {
         .build()
 
     private val gson = Gson()
+    private val urlDimPattern = Pattern.compile("/(\\d{2,4})x(\\d{2,4})/")
 
     fun extractTweetId(url: String): String? {
         val pattern = Pattern.compile(
@@ -31,6 +34,80 @@ class XApiService {
             val shortPattern = Pattern.compile("(?:status/)(\\d+)", Pattern.CASE_INSENSITIVE)
             val shortMatcher = shortPattern.matcher(url)
             if (shortMatcher.find()) shortMatcher.group(1) else null
+        }
+    }
+
+    /**
+     * Извлекает разрешение (ширина x высота) из URL видео/фото или JSON-метаданных поста.
+     */
+    private fun extractDimensions(mObj: JsonObject?, url: String): Pair<Int, Int>? {
+        if (url.isNotEmpty()) {
+            val m = urlDimPattern.matcher(url)
+            if (m.find()) {
+                val w = m.group(1)?.toIntOrNull() ?: 0
+                val h = m.group(2)?.toIntOrNull() ?: 0
+                if (w > 0 && h > 0) return Pair(w, h)
+            }
+        }
+        if (mObj != null) {
+            try {
+                if (mObj.has("size") && mObj.get("size").isJsonObject) {
+                    val s = mObj.getAsJsonObject("size")
+                    val w = s.get("width")?.asInt ?: 0
+                    val h = s.get("height")?.asInt ?: 0
+                    if (w > 0 && h > 0) return Pair(w, h)
+                }
+                if (mObj.has("original_info") && mObj.get("original_info").isJsonObject) {
+                    val o = mObj.getAsJsonObject("original_info")
+                    val w = o.get("width")?.asInt ?: 0
+                    val h = o.get("height")?.asInt ?: 0
+                    if (w > 0 && h > 0) return Pair(w, h)
+                }
+                val w = mObj.get("width")?.asInt ?: 0
+                val h = mObj.get("height")?.asInt ?: 0
+                if (w > 0 && h > 0) return Pair(w, h)
+            } catch (ignored: Exception) {}
+        }
+        return null
+    }
+
+    /**
+     * Вычисляет пропорциональное разрешение для режима HD 720p (короткая сторона = 720px, длинная <= 1280px).
+     */
+    private fun compute720pDimensions(origW: Int, origH: Int): Pair<Int, Int> {
+        val minSide = min(origW, origH)
+        val maxSide = max(origW, origH)
+        if (minSide <= 720 && maxSide <= 1280) return Pair(origW, origH)
+        val scale = min(720f / minSide.toFloat(), 1280f / maxSide.toFloat()).coerceAtMost(1.0f)
+        val newW = (((origW * scale).toInt() + 1) / 2 * 2).coerceAtLeast(2)
+        val newH = (((origH * scale).toInt() + 1) / 2 * 2).coerceAtLeast(2)
+        return Pair(newW, newH)
+    }
+
+    private fun buildVariantQualityLabel(index: Int, bitrate: Long, dims: Pair<Int, Int>?): String {
+        if (index == 0) {
+            return if (dims != null) {
+                "MP4 Видео (Оригинал • ${dims.first}×${dims.second})"
+            } else {
+                "MP4 Видео (Оригинал)"
+            }
+        }
+        if (dims != null) {
+            val shortSide = min(dims.first, dims.second)
+            val tier = when {
+                shortSide >= 1080 -> "Full HD 1080p"
+                shortSide >= 720 -> "HD 720p"
+                shortSide >= 480 -> "SD 480p"
+                else -> "${shortSide}p"
+            }
+            return "MP4 Видео ($tier • ${dims.first}×${dims.second})"
+        }
+        return when {
+            bitrate > 1_500_000 -> "MP4 Видео (Full HD 1080p)"
+            bitrate > 700_000 -> "MP4 Видео (HD 720p)"
+            bitrate > 350_000 -> "MP4 Видео (SD 480p)"
+            bitrate > 0 -> "MP4 Видео (360p)"
+            else -> "MP4 Видео (Вариант ${index + 1})"
         }
     }
 
@@ -154,35 +231,38 @@ class XApiService {
                             }
 
                             if (!isNativeGif) {
+                                val seenLabels = mutableSetOf<String>()
                                 for ((index, item) in mp4Variants.withIndex()) {
                                     val bitrate = item.first
                                     val vUrl = item.second
-                                    val qualityLabel = when {
-                                        bitrate > 1_500_000 -> "1080p (Full HD)"
-                                        bitrate > 700_000 -> "720p (HD)"
-                                        bitrate > 350_000 -> "480p (SD)"
-                                        bitrate > 0 -> "360p"
-                                        else -> if (index == 0) "Максимальное качество (MP4)" else "Стандартное качество (MP4)"
-                                    }
-
-                                    formats.add(
-                                        XFormatOption(
-                                            id = "mp4_$index",
-                                            label = qualityLabel,
-                                            extension = "mp4",
-                                            downloadUrl = vUrl,
-                                            bitrate = bitrate,
-                                            isGifConversion = false,
-                                            durationMs = durationMs
+                                    val dims = if (index == 0) extractDimensions(mObj, vUrl) else extractDimensions(null, vUrl)
+                                    val qualityLabel = buildVariantQualityLabel(index, bitrate, dims)
+                                    if (seenLabels.add(qualityLabel)) {
+                                        formats.add(
+                                            XFormatOption(
+                                                id = "mp4_$index",
+                                                label = qualityLabel,
+                                                extension = "mp4",
+                                                downloadUrl = vUrl,
+                                                bitrate = bitrate,
+                                                isGifConversion = false,
+                                                durationMs = durationMs
+                                            )
                                         )
-                                    )
+                                    }
                                 }
                             }
                         } else if (!isNativeGif && bestMp4Url.isNotEmpty()) {
+                            val origDims = extractDimensions(mObj, bestMp4Url)
+                            val mp4Label = if (origDims != null) {
+                                "MP4 Видео (Оригинал • ${origDims.first}×${origDims.second})"
+                            } else {
+                                "MP4 Видео (Оригинал)"
+                            }
                             formats.add(
                                 XFormatOption(
                                     id = "mp4_main",
-                                    label = "MP4 Видео (Оригинал)",
+                                    label = mp4Label,
                                     extension = "mp4",
                                     downloadUrl = bestMp4Url,
                                     isGifConversion = false,
@@ -191,11 +271,22 @@ class XApiService {
                             )
                         }
 
+                        val origDims = extractDimensions(mObj, bestMp4Url)
                         if (isNativeGif) {
+                            val gifLabel = if (origDims != null) {
+                                "GIF (Оригинал • ${origDims.first}×${origDims.second})"
+                            } else {
+                                "GIF (Оригинал)"
+                            }
+                            val mp4Label = if (origDims != null) {
+                                "MP4 Видео (Без конвертации • ${origDims.first}×${origDims.second})"
+                            } else {
+                                "MP4 Видео (Без конвертации)"
+                            }
                             formats.add(
                                 XFormatOption(
                                     id = "gif_format",
-                                    label = "GIF (Файл .gif — оригинальное разрешение)",
+                                    label = gifLabel,
                                     extension = "gif",
                                     downloadUrl = bestMp4Url,
                                     isGifConversion = true,
@@ -206,7 +297,7 @@ class XApiService {
                             formats.add(
                                 XFormatOption(
                                     id = "mp4_gif_fast",
-                                    label = "MP4 (Видеофайл без конвертации)",
+                                    label = mp4Label,
                                     extension = "mp4",
                                     downloadUrl = bestMp4Url,
                                     isGifConversion = false,
@@ -214,10 +305,15 @@ class XApiService {
                                 )
                             )
                         } else if (bestMp4Url.isNotEmpty()) {
+                            val origGifLabel = if (origDims != null) {
+                                "GIF (Оригинал • ${origDims.first}×${origDims.second})"
+                            } else {
+                                "GIF (Оригинал)"
+                            }
                             formats.add(
                                 XFormatOption(
                                     id = "gif_format_orig",
-                                    label = "GIF (Оригинальное разрешение HD — .gif)",
+                                    label = origGifLabel,
                                     extension = "gif",
                                     downloadUrl = bestMp4Url,
                                     isGifConversion = true,
@@ -225,17 +321,30 @@ class XApiService {
                                     targetGifMaxDim = 0
                                 )
                             )
-                            formats.add(
-                                XFormatOption(
-                                    id = "gif_format_fast",
-                                    label = "GIF (Компактный 720p — быстрый и лёгкий .gif)",
-                                    extension = "gif",
-                                    downloadUrl = mediumMp4Url,
-                                    isGifConversion = true,
-                                    durationMs = durationMs,
-                                    targetGifMaxDim = 720
+
+                            val needs720pOption = origDims == null ||
+                                min(origDims.first, origDims.second) > 720 ||
+                                max(origDims.first, origDims.second) > 1280
+
+                            if (needs720pOption) {
+                                val hdGifLabel = if (origDims != null) {
+                                    val hdDims = compute720pDimensions(origDims.first, origDims.second)
+                                    "GIF (HD 720p • ${hdDims.first}×${hdDims.second})"
+                                } else {
+                                    "GIF (HD 720p • компактный)"
+                                }
+                                formats.add(
+                                    XFormatOption(
+                                        id = "gif_format_fast",
+                                        label = hdGifLabel,
+                                        extension = "gif",
+                                        downloadUrl = mediumMp4Url,
+                                        isGifConversion = true,
+                                        durationMs = durationMs,
+                                        targetGifMaxDim = 720
+                                    )
                                 )
-                            )
+                            }
                         }
 
                         mediaList.add(
@@ -254,10 +363,17 @@ class XApiService {
                             if (photoUrl.contains("?")) "${photoUrl.substringBefore("?")}?name=orig" else "$photoUrl?name=orig"
                         } else photoUrl
 
+                        val photoDims = extractDimensions(mObj, photoUrl)
+                        val photoLabel = if (photoDims != null) {
+                            "JPG Фото (Оригинал • ${photoDims.first}×${photoDims.second})"
+                        } else {
+                            "JPG Фото (Оригинал)"
+                        }
+
                         formats.add(
                             XFormatOption(
                                 id = "photo_orig",
-                                label = "Оригинальное фото (HD)",
+                                label = photoLabel,
                                 extension = "jpg",
                                 downloadUrl = origUrl
                             )
@@ -345,36 +461,45 @@ class XApiService {
                                     }
 
                                     if (!isGif) {
+                                        val seenLabels = mutableSetOf<String>()
                                         for ((idx, item) in list.withIndex()) {
-                                            val label = when {
-                                                item.first > 1_500_000 -> "1080p (Full HD)"
-                                                item.first > 700_000 -> "720p (HD)"
-                                                item.first > 350_000 -> "480p (SD)"
-                                                item.first > 0 -> "360p"
-                                                else -> "Качество $idx"
-                                            }
-                                            formats.add(
-                                                XFormatOption(
-                                                    id = "mp4_$idx",
-                                                    label = label,
-                                                    extension = "mp4",
-                                                    downloadUrl = item.second,
-                                                    bitrate = item.first,
-                                                    isGifConversion = false,
-                                                    durationMs = durationMs
+                                            val dims = if (idx == 0) extractDimensions(mObj, item.second) else extractDimensions(null, item.second)
+                                            val label = buildVariantQualityLabel(idx, item.first, dims)
+                                            if (seenLabels.add(label)) {
+                                                formats.add(
+                                                    XFormatOption(
+                                                        id = "mp4_$idx",
+                                                        label = label,
+                                                        extension = "mp4",
+                                                        downloadUrl = item.second,
+                                                        bitrate = item.first,
+                                                        isGifConversion = false,
+                                                        durationMs = durationMs
+                                                    )
                                                 )
-                                            )
+                                            }
                                         }
                                     }
                                 }
                             }
 
+                            val origDims = extractDimensions(mObj, bestUrl)
                             if (bestUrl.isNotEmpty()) {
                                 if (isGif) {
+                                    val gifLabel = if (origDims != null) {
+                                        "GIF (Оригинал • ${origDims.first}×${origDims.second})"
+                                    } else {
+                                        "GIF (Оригинал)"
+                                    }
+                                    val mp4Label = if (origDims != null) {
+                                        "MP4 Видео (Без конвертации • ${origDims.first}×${origDims.second})"
+                                    } else {
+                                        "MP4 Видео (Без конвертации)"
+                                    }
                                     formats.add(
                                         XFormatOption(
                                             id = "gif_format",
-                                            label = "GIF (Файл .gif — оригинальное разрешение)",
+                                            label = gifLabel,
                                             extension = "gif",
                                             downloadUrl = bestUrl,
                                             isGifConversion = true,
@@ -385,7 +510,7 @@ class XApiService {
                                     formats.add(
                                         XFormatOption(
                                             id = "mp4_gif_fast",
-                                            label = "MP4 (Видеофайл без конвертации)",
+                                            label = mp4Label,
                                             extension = "mp4",
                                             downloadUrl = bestUrl,
                                             isGifConversion = false,
@@ -393,10 +518,15 @@ class XApiService {
                                         )
                                     )
                                 } else {
+                                    val origGifLabel = if (origDims != null) {
+                                        "GIF (Оригинал • ${origDims.first}×${origDims.second})"
+                                    } else {
+                                        "GIF (Оригинал)"
+                                    }
                                     formats.add(
                                         XFormatOption(
                                             id = "gif_format_orig",
-                                            label = "GIF (Оригинальное разрешение HD — .gif)",
+                                            label = origGifLabel,
                                             extension = "gif",
                                             downloadUrl = bestUrl,
                                             isGifConversion = true,
@@ -404,17 +534,30 @@ class XApiService {
                                             targetGifMaxDim = 0
                                         )
                                     )
-                                    formats.add(
-                                        XFormatOption(
-                                            id = "gif_format_fast",
-                                            label = "GIF (Компактный 720p — быстрый и лёгкий .gif)",
-                                            extension = "gif",
-                                            downloadUrl = mediumUrl.ifEmpty { bestUrl },
-                                            isGifConversion = true,
-                                            durationMs = durationMs,
-                                            targetGifMaxDim = 720
+
+                                    val needs720pOption = origDims == null ||
+                                        min(origDims.first, origDims.second) > 720 ||
+                                        max(origDims.first, origDims.second) > 1280
+
+                                    if (needs720pOption) {
+                                        val hdGifLabel = if (origDims != null) {
+                                            val hdDims = compute720pDimensions(origDims.first, origDims.second)
+                                            "GIF (HD 720p • ${hdDims.first}×${hdDims.second})"
+                                        } else {
+                                            "GIF (HD 720p • компактный)"
+                                        }
+                                        formats.add(
+                                            XFormatOption(
+                                                id = "gif_format_fast",
+                                                label = hdGifLabel,
+                                                extension = "gif",
+                                                downloadUrl = mediumUrl.ifEmpty { bestUrl },
+                                                isGifConversion = true,
+                                                durationMs = durationMs,
+                                                targetGifMaxDim = 720
+                                            )
                                         )
-                                    )
+                                    }
                                 }
                             }
 
@@ -429,10 +572,16 @@ class XApiService {
                             )
                         } else {
                             val origUrl = "$previewUrl?name=orig"
+                            val photoDims = extractDimensions(mObj, previewUrl)
+                            val photoLabel = if (photoDims != null) {
+                                "JPG Фото (Оригинал • ${photoDims.first}×${photoDims.second})"
+                            } else {
+                                "JPG Фото (Оригинал)"
+                            }
                             formats.add(
                                 XFormatOption(
                                     id = "photo_orig",
-                                    label = "Оригинальное фото (HD)",
+                                    label = photoLabel,
                                     extension = "jpg",
                                     downloadUrl = origUrl
                                 )
