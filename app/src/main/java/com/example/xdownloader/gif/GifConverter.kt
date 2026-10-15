@@ -502,7 +502,7 @@ object GifConverter {
                         if (bitmap != null) {
                             val lzwBytes = encoder.encodeFrameToLzwBytes(bitmap)
                             bitmap.recycle()
-                            reorderBuffer[gifOrder] = lzwBytes
+                            reorderBuffer.put(gifOrder, lzwBytes)
                         }
                     }
 
@@ -629,13 +629,16 @@ object GifConverter {
                 rgbPic = src
             } else {
                 val transform = ColorUtil.getTransform(src.color, ColorSpace.RGB)
-                var cached = buffers.rgbPic
-                if (cached == null || cached.width != src.width || cached.height != src.height) {
-                    cached = Picture.create(src.width, src.height, ColorSpace.RGB)
-                    buffers.rgbPic = cached
+                val existing: Picture? = buffers.rgbPic
+                val targetPic: Picture = if (existing != null && existing.width == src.width && existing.height == src.height) {
+                    existing
+                } else {
+                    val created: Picture = Picture.create(src.width, src.height, ColorSpace.RGB)
+                    buffers.rgbPic = created
+                    created
                 }
-                transform.transform(src, cached)
-                rgbPic = cached
+                transform.transform(src, targetPic)
+                rgbPic = targetPic
             }
 
             val w = rgbPic.width
@@ -686,7 +689,7 @@ object GifConverter {
                         val r = (bytes[bi++].toInt() + 128).coerceIn(0, 255)
                         val g = (bytes[bi++].toInt() + 128).coerceIn(0, 255)
                         val b = (bytes[bi++].toInt() + 128).coerceIn(0, 255)
-                        pixels[i] = (-0x1000000) or (r shl 16) or (g shl 8) or b
+                        pixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
                     } else {
                         pixels[i] = -0x1000000
                     }
@@ -703,7 +706,7 @@ object GifConverter {
                             val r = (bytes[bi].toInt() + 128).coerceIn(0, 255)
                             val g = (bytes[bi + 1].toInt() + 128).coerceIn(0, 255)
                             val b = (bytes[bi + 2].toInt() + 128).coerceIn(0, 255)
-                            pixels[outIdx++] = (-0x1000000) or (r shl 16) or (g shl 8) or b
+                            pixels[outIdx++] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
                         } else {
                             pixels[outIdx++] = -0x1000000
                         }
