@@ -31,9 +31,9 @@ import kotlin.math.min
 object GifConverter {
 
     /**
-     * Converts a local MP4 video file into an animated GIF.
-     * Uses pure Java H.264 decoding (JCodec) with exact signed-byte color restoration (+128)
-     * and drift-free cumulative centisecond frame timing from the MP4 mvhd header.
+     * Converts a local MP4 video file into an animated GIF at 100% original resolution (when maxDimension = 0).
+     * Streams frames directly into the GIF encoder one at a time using MP4 mvhd + stsz header metadata,
+     * keeping memory footprint minimal even for Full HD 1080p videos.
      * @return Pair of (Uri?, errorMessage?)
      */
     suspend fun convertVideoToGif(
@@ -43,7 +43,7 @@ object GifConverter {
         expectedDurationMs: Long = 0L,
         maxDurationSec: Int = 12,
         fps: Int = 15,
-        maxDimension: Int = 540,
+        maxDimension: Int = 0,
         onProgress: (Int) -> Unit
     ): Pair<Uri?, String?> = withContext(Dispatchers.IO) {
         if (!videoFile.exists() || !videoFile.canRead() || videoFile.length() < 1000L) {
@@ -103,7 +103,7 @@ object GifConverter {
             val totalTargetFrames = maxDurationSec * 30
             val diagLog = StringBuilder()
 
-            // УРОВЕНЬ 1 (Основной): Чистый Java декодер JCodec с прямым чтением mvhd таймингов
+            // УРОВЕНЬ 1 (Основной): Потоковый декодер JCodec в оригинальном разрешении видео 1:1
             try {
                 framesAdded = extractWithJCodec(
                     videoFile = videoFile,
@@ -118,7 +118,7 @@ object GifConverter {
                 diagLog.append("JCodec: ").append(e.message ?: e.javaClass.simpleName).append("; ")
             }
 
-            // УРОВЕНЬ 2 (Резервный): MediaMetadataRetriever
+            // УРОВЕНЬ 2 (Резервный): MediaMetadataRetriever в оригинальном разрешении
             if (framesAdded == 0) {
                 try {
                     framesAdded = extractWithRetriever(
@@ -209,20 +209,21 @@ object GifConverter {
     }
 
     /**
-     * Прямое бинарное чтение длительности MP4-файла (в миллисекундах) из атома 'mvhd' (ISO/IEC 14496-12).
-     * Работает мгновенно и на 100% независимо от Android MediaMetadataRetriever.
+     * Прямое бинарное чтение метаданных MP4-файла из атомов 'mvhd' (длительность в мс)
+     * и 'stsz' внутри видеотрека 'vide' (точное число видеокадров).
      */
-    fun parseMp4DurationMs(videoFile: File): Long {
+    fun parseMp4Meta(videoFile: File): Pair<Long, Int> {
+        var durationMs = 0L
+        var videoFrames = 0
         var raf: RandomAccessFile? = null
         try {
             raf = RandomAccessFile(videoFile, "r")
             val len = raf.length()
-            if (len < 48L) return 0L
+            if (len < 48L) return Pair(0L, 0)
 
-            val chunkSize = min(len, 1024L * 1024L).toInt()
+            val chunkSize = min(len, 2L * 1024L * 1024L).toInt()
             val buf = ByteArray(chunkSize)
 
-            // Проверяем первые 1 МБ и последние 1 МБ (если атом moov расположен в конце файла)
             for (pass in 0 until 2) {
                 if (pass == 0) {
                     raf.seek(0L)
@@ -234,9 +235,12 @@ object GifConverter {
                 if (read < 40) continue
 
                 val bb = ByteBuffer.wrap(buf, 0, read)
+                var inVideoTrack = false
+
                 for (i in 0 until (read - 36)) {
-                    // 0x6D766864 = 'm','v','h','d'
-                    if (bb.getInt(i) == 0x6D766864) {
+                    val tag = bb.getInt(i)
+                    // 'mvhd' = 0x6D766864
+                    if (tag == 0x6D766864 && durationMs <= 0L) {
                         val version = buf[i + 4].toInt() and 0xFF
                         val timescale: Long
                         val duration: Long
@@ -250,20 +254,42 @@ object GifConverter {
                             continue
                         }
                         if (timescale > 0L && duration > 0L && duration < timescale * 36000L) {
-                            return (duration * 1000L) / timescale
+                            durationMs = (duration * 1000L) / timescale
+                        }
+                    }
+                    // 'trak' = 0x7472616B
+                    if (tag == 0x7472616B) {
+                        inVideoTrack = false
+                    }
+                    // 'vide' = 0x76696465
+                    if (tag == 0x76696465) {
+                        inVideoTrack = true
+                    }
+                    // 'soun' = 0x736F756E
+                    if (tag == 0x736F756E) {
+                        inVideoTrack = false
+                    }
+                    // 'stsz' = 0x7374737A
+                    if (tag == 0x7374737A && inVideoTrack && videoFrames <= 0) {
+                        val count = bb.getInt(i + 12)
+                        if (count in 1..999999) {
+                            videoFrames = count
                         }
                     }
                 }
+                if (durationMs > 0L && videoFrames > 0) break
             }
         } catch (ignored: Throwable) {
         } finally {
             try { raf?.close() } catch (ignored: Throwable) {}
         }
-        return 0L
+        return Pair(durationMs, videoFrames)
     }
 
     /**
-     * Декодирование видео через JCodec с сохранением точной длительности 1:1 и естественной скорости кадров.
+     * Потоковое декодирование видео через JCodec в оригинальном разрешении видео (1:1).
+     * Каждый кадр кодируется в GIF сразу после декодирования и немедленно освобождается из памяти,
+     * что позволяет конвертировать даже Full HD 1080p ролики без риска OutOfMemoryError.
      */
     private fun extractWithJCodec(
         videoFile: File,
@@ -275,63 +301,10 @@ object GifConverter {
         onProgress: (Int) -> Unit
     ): Int {
         var channel: SeekableByteChannel? = null
-        val decodedBitmaps = mutableListOf<Bitmap>()
 
         try {
-            channel = NIOUtils.readableChannel(videoFile)
-            val grab = FrameGrab.createFrameGrab(channel)
-
-            var readCount = 0
-            var preStep = 1
-            var reachedEof = false
-
-            while (readCount < maxFrames) {
-                val pic: Picture? = grab.nativeFrame
-                if (pic == null) {
-                    reachedEof = true
-                    break
-                }
-
-                if (readCount % preStep == 0) {
-                    val bitmap = jcodecPictureToBitmap(pic)
-                    if (bitmap != null) {
-                        val scaled = if (targetWidth > 0 && bitmap.width > targetWidth) {
-                            val aspect = bitmap.height.toFloat() / bitmap.width.toFloat()
-                            val targetHeight = ((targetWidth * aspect).toInt() / 2) * 2
-                            val s = Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight.coerceAtLeast(2), true)
-                            if (s != bitmap) bitmap.recycle()
-                            s
-                        } else bitmap
-
-                        decodedBitmaps.add(scaled)
-
-                        // Защита от переполнения памяти на длинных 60fps роликах:
-                        // если буфер превысил 150 кадров, уплотняем его вдвое
-                        if (decodedBitmaps.size > 150) {
-                            val compacted = mutableListOf<Bitmap>()
-                            for ((idx, bmp) in decodedBitmaps.withIndex()) {
-                                if (idx % 2 == 0) {
-                                    compacted.add(bmp)
-                                } else {
-                                    bmp.recycle()
-                                }
-                            }
-                            decodedBitmaps.clear()
-                            decodedBitmaps.addAll(compacted)
-                            preStep *= 2
-                        }
-                    }
-                }
-                readCount++
-            }
-
-            if (decodedBitmaps.isEmpty()) return 0
-
-            // Определяем точную длительность видео (в мс):
-            // 1) Из бинарного заголовка MP4 (mvhd)
-            // 2) Из ответа API X/Twitter (duration_millis)
-            // 3) Из MediaMetadataRetriever
-            var fullVideoDurationMs = parseMp4DurationMs(videoFile)
+            val (parsedDurationMs, parsedFrameCount) = parseMp4Meta(videoFile)
+            var fullVideoDurationMs = parsedDurationMs
             if (fullVideoDurationMs <= 0L && expectedDurationMs > 0L) {
                 fullVideoDurationMs = expectedDurationMs
             }
@@ -343,73 +316,149 @@ object GifConverter {
                     mmr.release()
                 } catch (ignored: Throwable) {}
             }
-            if (fullVideoDurationMs <= 0L) {
-                // Безопасный расчёт при 20 fps, если метаданные отсутствуют
-                fullVideoDurationMs = (readCount * 1000L) / 20L
-            }
 
-            val maxAllowedMs = maxDurationSec * 1000L
-            val clipDurationMs = if (reachedEof || fullVideoDurationMs <= maxAllowedMs) {
-                fullVideoDurationMs.coerceAtLeast(200L)
-            } else {
-                maxAllowedMs.toLong()
-            }
+            channel = NIOUtils.readableChannel(videoFile)
+            val grab = FrameGrab.createFrameGrab(channel)
 
-            // Определяем оптимальный шаг кадров:
-            // Для роликов <= 20 fps сохраняем 100% кадров (postStep = 1).
-            // Для 24..36 fps берём каждый 2-й кадр (плавные 12..18 fps).
-            // Для 50..60 fps берём каждый 3-й кадр (плавные 17..20 fps).
-            val currentFps = (decodedBitmaps.size * 1000.0) / clipDurationMs
-            val postStep = when {
-                currentFps > 36.0 -> 3
-                currentFps > 20.0 -> 2
-                else -> 1
-            }
-
-            val framesToEncode = mutableListOf<Bitmap>()
-            for ((index, bmp) in decodedBitmaps.withIndex()) {
-                if (index % postStep == 0) {
-                    framesToEncode.add(bmp)
+            // Если число кадров и длительность известны из MP4 заголовка (99.9% всех MP4),
+            // кодируем кадры в потоковом режиме (по 1 кадру в оперативной памяти!) в 100% оригинальном разрешении
+            if (parsedFrameCount > 0 && fullVideoDurationMs > 0L) {
+                val maxAllowedMs = maxDurationSec * 1000L
+                val totalRawToRead = if (fullVideoDurationMs > maxAllowedMs) {
+                    ((parsedFrameCount.toLong() * maxAllowedMs) / fullVideoDurationMs).toInt().coerceIn(1, maxFrames)
                 } else {
+                    min(parsedFrameCount, maxFrames)
+                }
+                val clipDurationMs = if (fullVideoDurationMs > maxAllowedMs) {
+                    maxAllowedMs.toLong()
+                } else {
+                    fullVideoDurationMs.coerceAtLeast(200L)
+                }
+
+                val originalFps = (totalRawToRead * 1000.0) / clipDurationMs
+                val step = when {
+                    originalFps > 36.0 -> 3
+                    originalFps > 20.0 -> 2
+                    else -> 1
+                }
+
+                val totalFramesToEncode = ((totalRawToRead + step - 1) / step).coerceAtLeast(1)
+                encoder.setRepeat(0)
+
+                var readCount = 0
+                var encodedCount = 0
+
+                while (readCount < totalRawToRead) {
+                    val pic: Picture = grab.nativeFrame ?: break
+
+                    if (readCount % step == 0) {
+                        val bitmap = jcodecPictureToBitmap(pic)
+                        if (bitmap != null) {
+                            val finalBmp = if (targetWidth > 0 && bitmap.width > targetWidth) {
+                                val aspect = bitmap.height.toFloat() / bitmap.width.toFloat()
+                                val targetHeight = ((targetWidth * aspect).toInt() / 2) * 2
+                                val s = Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight.coerceAtLeast(2), true)
+                                if (s != bitmap) bitmap.recycle()
+                                s
+                            } else bitmap
+
+                            val startCs = Math.round((encodedCount * clipDurationMs) / (10.0 * totalFramesToEncode)).toInt()
+                            val endCs = Math.round(((encodedCount + 1) * clipDurationMs) / (10.0 * totalFramesToEncode)).toInt()
+                            val delayCs = (endCs - startCs).coerceIn(2, 100)
+                            encoder.setDelay(delayCs * 10)
+
+                            encoder.addFrame(finalBmp)
+                            finalBmp.recycle()
+                            encodedCount++
+
+                            val p = (35 + (encodedCount * 60 / totalFramesToEncode)).coerceIn(35, 95)
+                            kotlinx.coroutines.runBlocking(Dispatchers.Main) {
+                                onProgress(p)
+                            }
+                        }
+                    }
+                    readCount++
+                }
+
+                return encodedCount
+            }
+
+            // Резервный режим, если в MP4 нестандартный заголовок без stsz
+            val decodedBitmaps = mutableListOf<Bitmap>()
+            var readCount = 0
+            try {
+                while (readCount < maxFrames) {
+                    val pic: Picture = grab.nativeFrame ?: break
+                    val bitmap = jcodecPictureToBitmap(pic)
+                    if (bitmap != null) {
+                        val finalBmp = if (targetWidth > 0 && bitmap.width > targetWidth) {
+                            val aspect = bitmap.height.toFloat() / bitmap.width.toFloat()
+                            val targetHeight = ((targetWidth * aspect).toInt() / 2) * 2
+                            val s = Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight.coerceAtLeast(2), true)
+                            if (s != bitmap) bitmap.recycle()
+                            s
+                        } else bitmap
+                        decodedBitmaps.add(finalBmp)
+                    }
+                    readCount++
+                }
+
+                if (decodedBitmaps.isEmpty()) return 0
+
+                val clipDurationMs = if (fullVideoDurationMs > 0L) {
+                    min(fullVideoDurationMs, maxDurationSec * 1000L).coerceAtLeast(200L)
+                } else {
+                    ((readCount * 1000L) / 20L).coerceAtLeast(200L)
+                }
+
+                val currentFps = (decodedBitmaps.size * 1000.0) / clipDurationMs
+                val postStep = when {
+                    currentFps > 36.0 -> 3
+                    currentFps > 20.0 -> 2
+                    else -> 1
+                }
+
+                val framesToEncode = mutableListOf<Bitmap>()
+                for ((index, bmp) in decodedBitmaps.withIndex()) {
+                    if (index % postStep == 0) {
+                        framesToEncode.add(bmp)
+                    } else {
+                        bmp.recycle()
+                    }
+                }
+
+                val totalFrames = framesToEncode.size
+                if (totalFrames == 0) return 0
+
+                encoder.setRepeat(0)
+                for ((index, bmp) in framesToEncode.withIndex()) {
+                    val startCs = Math.round((index * clipDurationMs) / (10.0 * totalFrames)).toInt()
+                    val endCs = Math.round(((index + 1) * clipDurationMs) / (10.0 * totalFrames)).toInt()
+                    val delayCs = (endCs - startCs).coerceIn(2, 100)
+                    encoder.setDelay(delayCs * 10)
+
+                    encoder.addFrame(bmp)
                     bmp.recycle()
+
+                    val p = 35 + ((index + 1) * 60 / totalFrames)
+                    kotlinx.coroutines.runBlocking(Dispatchers.Main) {
+                        onProgress(p)
+                    }
+                }
+                return totalFrames
+            } finally {
+                for (b in decodedBitmaps) {
+                    if (!b.isRecycled) b.recycle()
                 }
             }
-
-            val totalFrames = framesToEncode.size
-            if (totalFrames == 0) return 0
-
-            encoder.setRepeat(0) // Бесконечный цикл
-
-            // Пошаговое вычисление задержки каждого кадра в сотых долях секунды (10 мс)
-            // полностью исключает накопление ошибки округления: сумма задержек GIF равна clipDurationMs 1:1!
-            for ((index, bmp) in framesToEncode.withIndex()) {
-                val startCs = Math.round((index * clipDurationMs) / (10.0 * totalFrames)).toInt()
-                val endCs = Math.round(((index + 1) * clipDurationMs) / (10.0 * totalFrames)).toInt()
-                val delayCs = (endCs - startCs).coerceIn(2, 100)
-                encoder.setDelay(delayCs * 10)
-
-                encoder.addFrame(bmp)
-                bmp.recycle()
-
-                val p = 35 + ((index + 1) * 60 / totalFrames)
-                kotlinx.coroutines.runBlocking(Dispatchers.Main) {
-                    onProgress(p)
-                }
-            }
-
-            return totalFrames
         } finally {
             try { NIOUtils.closeQuietly(channel) } catch (ignored: Throwable) {}
-            for (b in decodedBitmaps) {
-                if (!b.isRecycled) b.recycle()
-            }
         }
     }
 
     /**
-     * Конвертация Picture из JCodec 0.2.5 в стандартный Android ARGB_8888 Bitmap.
-     * В JCodec 0.2.5 компоненты Picture хранятся в знаковом диапазоне [-128..127] (значение - 128),
-     * поэтому прибавление +128 восстанавливает точные исходные цвета [0..255] без затемнения.
+     * Конвертация Picture из JCodec 0.2.5 в стандартный Android ARGB_8888 Bitmap
+     * в полном исходном разрешении с восстановлением знакового диапазона [-128..127] -> [0..255].
      */
     private fun jcodecPictureToBitmap(src: Picture): Bitmap? {
         return try {
@@ -442,7 +491,6 @@ object GifConverter {
 
             val fullBitmap = Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
 
-            // Безопасная обрезка выравнивания макроблоков H.264 (например, 1088 -> 1080), если задан crop
             var cropX = 0
             var cropY = 0
             var cropW = w
@@ -477,7 +525,7 @@ object GifConverter {
     }
 
     /**
-     * Извлечение кадров через MediaMetadataRetriever (резервный метод).
+     * Извлечение кадров через MediaMetadataRetriever в оригинальном разрешении (резервный метод).
      */
     private fun extractWithRetriever(
         context: Context,
@@ -544,7 +592,8 @@ object GifConverter {
 
             val mmr = retriever ?: return 0
 
-            var durationMs = parseMp4DurationMs(videoFile)
+            val (parsedDurationMs, _) = parseMp4Meta(videoFile)
+            var durationMs = parsedDurationMs
             if (durationMs <= 0L && expectedDurationMs > 0L) {
                 durationMs = expectedDurationMs
             }
@@ -562,22 +611,9 @@ object GifConverter {
                 val timeUs = (i * actualDurationMs * 1000L) / totalFrames
                 var frame: Bitmap? = null
 
-                // OPTION_CLOSEST извлекает точный кадр, а не только ключевой I-кадр!
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 && maxDimension > 0) {
-                    try {
-                        val videoWidth = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: maxDimension
-                        val videoHeight = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: maxDimension
-                        val aspect = videoHeight.toFloat() / videoWidth.toFloat()
-                        val targetHeight = ((maxDimension * aspect).toInt() / 2) * 2
-                        frame = mmr.getScaledFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST, maxDimension, targetHeight.coerceAtLeast(2))
-                    } catch (ignored: Throwable) {}
-                }
-
-                if (frame == null) {
-                    try {
-                        frame = mmr.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
-                    } catch (ignored: Throwable) {}
-                }
+                try {
+                    frame = mmr.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                } catch (ignored: Throwable) {}
 
                 if (frame == null) {
                     try {
@@ -599,6 +635,7 @@ object GifConverter {
                     encoder.setDelay(delayCs * 10)
 
                     encoder.addFrame(scaled)
+                    if (scaled != toUse) scaled.recycle()
                     added++
 
                     if (frame != null) {
@@ -623,7 +660,7 @@ object GifConverter {
     }
 
     /**
-     * Извлечение кадров через Glide с использованием RequestOptions.frameOf(timeUs).
+     * Извлечение кадров через Glide в оригинальном разрешении (резервный метод).
      */
     private fun extractWithGlide(
         context: Context,
@@ -637,7 +674,8 @@ object GifConverter {
     ): Int {
         var added = 0
         try {
-            val durationMs = parseMp4DurationMs(videoFile).takeIf { it > 0L }
+            val (parsedDurationMs, _) = parseMp4Meta(videoFile)
+            val durationMs = parsedDurationMs.takeIf { it > 0L }
                 ?: expectedDurationMs.takeIf { it > 0L }
                 ?: 3000L
             val actualDurationMs = min(durationMs, maxDurationSec * 1000L).coerceAtLeast(300L)
@@ -649,28 +687,25 @@ object GifConverter {
                 val timeUs = (i * actualDurationMs * 1000L) / totalFrames
                 var frame: Bitmap? = null
                 try {
-                    frame = Glide.with(context.applicationContext)
+                    val req = Glide.with(context.applicationContext)
                         .asBitmap()
                         .load(videoFile)
                         .apply(RequestOptions.frameOf(timeUs))
-                        .submit(maxDimension, maxDimension)
-                        .get()
+                    frame = if (maxDimension > 0) {
+                        req.submit(maxDimension, maxDimension).get()
+                    } else {
+                        req.submit().get()
+                    }
                 } catch (ignored: Throwable) {}
 
                 val toUse = frame ?: lastValid
                 if (toUse != null) {
-                    val scaled = if (maxDimension > 0 && toUse.width > maxDimension) {
-                        val aspect = toUse.height.toFloat() / toUse.width.toFloat()
-                        val targetHeight = ((maxDimension * aspect).toInt() / 2) * 2
-                        Bitmap.createScaledBitmap(toUse, maxDimension, targetHeight.coerceAtLeast(2), true)
-                    } else toUse
-
                     val startCs = Math.round((i * actualDurationMs) / (10.0 * totalFrames)).toInt()
                     val endCs = Math.round(((i + 1) * actualDurationMs) / (10.0 * totalFrames)).toInt()
                     val delayCs = (endCs - startCs).coerceIn(2, 100)
                     encoder.setDelay(delayCs * 10)
 
-                    encoder.addFrame(scaled)
+                    encoder.addFrame(toUse)
                     added++
 
                     if (frame != null) {

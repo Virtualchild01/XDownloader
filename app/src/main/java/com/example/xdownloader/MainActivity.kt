@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.database.Cursor
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
@@ -28,7 +29,12 @@ import com.example.xdownloader.api.XPostInfo
 import com.example.xdownloader.databinding.ActivityMainBinding
 import com.example.xdownloader.utils.DownloadUtil
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
 
@@ -41,6 +47,8 @@ class MainActivity : AppCompatActivity() {
     private var selectedFormat: XFormatOption? = null
     private var currentUrl: String? = null
     private var lastSavedFileUri: Uri? = null
+    private var lastSavedMimeType: String = "image/gif"
+    private var downloadMonitorJob: Job? = null
 
     companion object {
         private const val PREFS_NAME = "x_downloader_prefs"
@@ -152,7 +160,7 @@ class MainActivity : AppCompatActivity() {
             if (uri != null) {
                 try {
                     val intent = Intent(Intent.ACTION_VIEW).apply {
-                        setDataAndType(uri, "image/gif")
+                        setDataAndType(uri, lastSavedMimeType)
                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     }
                     startActivity(intent)
@@ -168,11 +176,11 @@ class MainActivity : AppCompatActivity() {
             if (uri != null) {
                 try {
                     val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                        type = "image/gif"
+                        type = lastSavedMimeType
                         putExtra(Intent.EXTRA_STREAM, uri)
                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     }
-                    startActivity(Intent.createChooser(shareIntent, "Поделиться файлом GIF"))
+                    startActivity(Intent.createChooser(shareIntent, "Поделиться файлом"))
                     return@setOnClickListener
                 } catch (ignored: Exception) {}
             }
@@ -214,6 +222,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        downloadMonitorJob?.cancel()
         binding.llLoading.visibility = View.VISIBLE
         binding.cardResult.visibility = View.GONE
         binding.btnFind.isEnabled = false
@@ -337,6 +346,7 @@ class MainActivity : AppCompatActivity() {
         val post = currentPostInfo ?: return
         val title = post.tweetText.take(30).ifEmpty { "X_Post_${post.tweetId}" }
 
+        downloadMonitorJob?.cancel()
         lastSavedFileUri = null
         binding.layoutStatus.visibility = View.VISIBLE
         binding.progressDownload.visibility = View.VISIBLE
@@ -370,6 +380,7 @@ class MainActivity : AppCompatActivity() {
 
                 if (uri != null) {
                     lastSavedFileUri = uri
+                    lastSavedMimeType = "image/gif"
                     binding.tvStatus.text = "Готово! Файл GIF сохранён в «Загрузки»"
                     Toast.makeText(this@MainActivity, getString(R.string.toast_gif_saved), Toast.LENGTH_LONG).show()
                 } else {
@@ -380,16 +391,108 @@ class MainActivity : AppCompatActivity() {
             }
         } else {
             binding.progressDownload.isIndeterminate = true
-            binding.tvStatus.text = "Загрузка запущена в фоновом режиме через менеджер загрузок..."
+            binding.tvStatus.text = "Скачивание файла..."
 
-            DownloadUtil.enqueueDownload(
+            val downloadId = DownloadUtil.enqueueDownload(
                 context = this,
                 url = format.downloadUrl,
                 title = title,
                 formatLabel = format.label,
                 extension = format.extension
             )
+
+            val mimeType = when (format.extension.lowercase()) {
+                "mp4" -> "video/mp4"
+                "gif" -> "image/gif"
+                else -> "image/jpeg"
+            }
+
             Toast.makeText(this, getString(R.string.toast_download_started), Toast.LENGTH_SHORT).show()
+            trackDownloadProgress(downloadId, mimeType)
+        }
+    }
+
+    /**
+     * Отслеживает статус системного DownloadManager в реальном времени,
+     * обновляет прогресс-бар и меняет статус на «Готово!» сразу после завершения скачивания.
+     */
+    private fun trackDownloadProgress(downloadId: Long, mimeType: String) {
+        val downloadManager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+
+        downloadMonitorJob = lifecycleScope.launch(Dispatchers.IO) {
+            var isFinished = false
+
+            while (isActive && !isFinished) {
+                val query = DownloadManager.Query().setFilterById(downloadId)
+                var cursor: Cursor? = null
+                try {
+                    cursor = downloadManager.query(query)
+                    if (cursor != null && cursor.moveToFirst()) {
+                        val statusIdx = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
+                        val bytesIdx = cursor.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
+                        val totalIdx = cursor.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
+
+                        val status = if (statusIdx >= 0) cursor.getInt(statusIdx) else DownloadManager.STATUS_RUNNING
+                        val downloaded = if (bytesIdx >= 0) cursor.getLong(bytesIdx) else 0L
+                        val total = if (totalIdx >= 0) cursor.getLong(totalIdx) else -1L
+
+                        when (status) {
+                            DownloadManager.STATUS_SUCCESSFUL -> {
+                                isFinished = true
+                                val savedUri = try {
+                                    downloadManager.getUriForDownloadedFile(downloadId)
+                                } catch (ignored: Exception) {
+                                    null
+                                }
+                                withContext(Dispatchers.Main) {
+                                    lastSavedFileUri = savedUri
+                                    lastSavedMimeType = mimeType
+                                    binding.progressDownload.visibility = View.GONE
+                                    binding.tvStatus.text = "Готово! Файл сохранён в «Загрузки»"
+                                    Toast.makeText(this@MainActivity, "Файл сохранён в «Загрузки»!", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                            DownloadManager.STATUS_FAILED -> {
+                                isFinished = true
+                                withContext(Dispatchers.Main) {
+                                    binding.progressDownload.visibility = View.GONE
+                                    binding.tvStatus.text = "Ошибка при скачивании файла"
+                                    Toast.makeText(this@MainActivity, "Не удалось скачать файл", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                            DownloadManager.STATUS_RUNNING, DownloadManager.STATUS_PAUSED, DownloadManager.STATUS_PENDING -> {
+                                if (total > 0L) {
+                                    val pct = ((downloaded * 100L) / total).toInt().coerceIn(0, 100)
+                                    withContext(Dispatchers.Main) {
+                                        binding.progressDownload.isIndeterminate = false
+                                        binding.progressDownload.progress = pct
+                                        binding.tvStatus.text = "Скачивание файла: $pct%"
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Загрузка была отменена пользователем или удалена из очереди
+                        isFinished = true
+                        withContext(Dispatchers.Main) {
+                            binding.progressDownload.visibility = View.GONE
+                            binding.tvStatus.text = ""
+                        }
+                    }
+                } catch (ignored: Exception) {
+                    isFinished = true
+                    withContext(Dispatchers.Main) {
+                        binding.progressDownload.visibility = View.GONE
+                        binding.tvStatus.text = "Готово! Файл сохранён в «Загрузки»"
+                    }
+                } finally {
+                    try { cursor?.close() } catch (ignored: Exception) {}
+                }
+
+                if (!isFinished) {
+                    delay(250)
+                }
+            }
         }
     }
 

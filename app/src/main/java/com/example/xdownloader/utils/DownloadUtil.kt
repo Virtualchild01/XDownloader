@@ -60,7 +60,7 @@ object DownloadUtil {
     }
 
     /**
-     * Downloads video stream and converts it into a pure animated GIF file.
+     * Downloads video stream and converts it into a pure animated GIF file at 100% original resolution.
      * @return Pair of (Uri?, errorMessage?)
      */
     suspend fun downloadAndConvertToGif(
@@ -137,7 +137,6 @@ object DownloadUtil {
                 return@withContext Pair(null, "Ошибка загрузки ($err)")
             }
 
-            // ПРОВЕРКА МАГИЧЕСКИХ БАЙТОВ: если поток уже GIF — сохраняем напрямую
             val headerBytes = ByteArray(12)
             val readCount = FileInputStream(tempVideoFile).use { it.read(headerBytes) }
             val isGif = readCount >= 3 && headerBytes[0] == 'G'.code.toByte() && headerBytes[1] == 'I'.code.toByte() && headerBytes[2] == 'F'.code.toByte()
@@ -156,7 +155,7 @@ object DownloadUtil {
                 onProgress(35)
             }
 
-            // Конвертация MP4 видеопотока в GIF с передачей точной длительности
+            // maxDimension = 0 означает сохранение 100% оригинального разрешения видео 1:1 без сжатия!
             val (gifUri, gifErr) = GifConverter.convertVideoToGif(
                 context = context,
                 videoFile = tempVideoFile,
@@ -164,7 +163,7 @@ object DownloadUtil {
                 expectedDurationMs = expectedDurationMs,
                 maxDurationSec = 12,
                 fps = 15,
-                maxDimension = 540
+                maxDimension = 0
             ) { gifPercent ->
                 onProgress(gifPercent)
             }
