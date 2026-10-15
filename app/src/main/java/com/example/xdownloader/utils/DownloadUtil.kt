@@ -3,6 +3,7 @@ package com.example.xdownloader.utils
 import android.app.DownloadManager
 import android.content.ContentValues
 import android.content.Context
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -66,6 +67,7 @@ object DownloadUtil {
         context: Context,
         videoUrl: String,
         title: String,
+        expectedDurationMs: Long = 0L,
         onStatusUpdate: (String) -> Unit,
         onProgress: (Int) -> Unit
     ): Pair<Uri?, String?> = withContext(Dispatchers.IO) {
@@ -135,12 +137,11 @@ object DownloadUtil {
                 return@withContext Pair(null, "Ошибка загрузки ($err)")
             }
 
-            // ПРОВЕРКА МАГИЧЕСКИХ БАЙТОВ: проверяем, что скачанный файл действительно медиа, а не HTML-заглушка провайдера
+            // ПРОВЕРКА МАГИЧЕСКИХ БАЙТОВ: если поток уже GIF — сохраняем напрямую
             val headerBytes = ByteArray(12)
             val readCount = FileInputStream(tempVideoFile).use { it.read(headerBytes) }
             val isGif = readCount >= 3 && headerBytes[0] == 'G'.code.toByte() && headerBytes[1] == 'I'.code.toByte() && headerBytes[2] == 'F'.code.toByte()
 
-            // Если поток УЖЕ является GIF-файлом — сохраняем его напрямую без потерь!
             if (isGif) {
                 val safeTitle = sanitizeFilename(title)
                 val directGifUri = saveRawGifToDownloads(context, tempVideoFile, "${safeTitle}_anim.gif")
@@ -155,17 +156,17 @@ object DownloadUtil {
                 onProgress(35)
             }
 
-            // Конвертация MP4 видеопотока в GIF
+            // Конвертация MP4 видеопотока в GIF с передачей точной длительности
             val (gifUri, gifErr) = GifConverter.convertVideoToGif(
                 context = context,
                 videoFile = tempVideoFile,
                 targetTitle = "X_${sanitizeFilename(title)}",
-                maxDurationSec = 10,
-                fps = 10,
+                expectedDurationMs = expectedDurationMs,
+                maxDurationSec = 12,
+                fps = 15,
                 maxDimension = 540
             ) { gifPercent ->
-                val totalProgress = 35 + (gifPercent * 65 / 100)
-                onProgress(totalProgress)
+                onProgress(gifPercent)
             }
 
             Pair(gifUri, gifErr)
@@ -205,6 +206,9 @@ object DownloadUtil {
                         input.copyTo(output)
                     }
                 }
+                try {
+                    MediaScannerConnection.scanFile(context, arrayOf(targetFile.absolutePath), arrayOf("image/gif"), null)
+                } catch (ignored: Throwable) {}
                 Uri.fromFile(targetFile)
             }
         } catch (ignored: Exception) {

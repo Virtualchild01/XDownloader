@@ -243,6 +243,7 @@ class MainActivity : AppCompatActivity() {
 
         val firstMedia = postInfo.mediaItems.firstOrNull() ?: return
         selectedMediaItem = firstMedia
+        lastSavedFileUri = null
 
         // Badge styling
         when (firstMedia.type) {
@@ -336,22 +337,25 @@ class MainActivity : AppCompatActivity() {
         val post = currentPostInfo ?: return
         val title = post.tweetText.take(30).ifEmpty { "X_Post_${post.tweetId}" }
 
-        // Показываем индикатор прогресса строго ПОД кнопками «В галерею» и «Поделиться»
+        lastSavedFileUri = null
         binding.layoutStatus.visibility = View.VISIBLE
         binding.progressDownload.visibility = View.VISIBLE
 
         if (format.isGifConversion) {
-            // GIF conversion in-app
             binding.progressDownload.isIndeterminate = false
             binding.progressDownload.progress = 0
             binding.btnDownload.isEnabled = false
             binding.tvStatus.text = "Подготовка к конвертации GIF..."
+
+            val expectedDurationMs = format.durationMs.takeIf { it > 0L }
+                ?: selectedMediaItem?.durationMs ?: 0L
 
             lifecycleScope.launch {
                 val (uri, errorMsg) = DownloadUtil.downloadAndConvertToGif(
                     context = this@MainActivity,
                     videoUrl = format.downloadUrl,
                     title = title,
+                    expectedDurationMs = expectedDurationMs,
                     onStatusUpdate = { status ->
                         binding.tvStatus.text = status
                     },
@@ -366,7 +370,7 @@ class MainActivity : AppCompatActivity() {
 
                 if (uri != null) {
                     lastSavedFileUri = uri
-                    binding.tvStatus.text = "Готово! Анимация сохранена в «Загрузки»"
+                    binding.tvStatus.text = "Готово! Файл GIF сохранён в «Загрузки»"
                     Toast.makeText(this@MainActivity, getString(R.string.toast_gif_saved), Toast.LENGTH_LONG).show()
                 } else {
                     val err = errorMsg ?: "Не удалось создать GIF"
@@ -375,7 +379,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         } else {
-            // Standard direct download via DownloadManager
             binding.progressDownload.isIndeterminate = true
             binding.tvStatus.text = "Загрузка запущена в фоновом режиме через менеджер загрузок..."
 

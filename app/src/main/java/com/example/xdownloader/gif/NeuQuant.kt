@@ -4,7 +4,7 @@ import kotlin.math.abs
 
 /**
  * NeuQuant Neural-Net Quantization Algorithm
- * Adapted for Kotlin.
+ * Adapted for Kotlin with exact 0..255 unbiasing and bounds protection.
  */
 class NeuQuant(
     private val thepicture: ByteArray,
@@ -60,7 +60,7 @@ class NeuQuant(
         for (i in 0 until netsize) {
             val j = index[i]
             // Standard GIF palette is RGB: byte 0 = R, byte 1 = G, byte 2 = B.
-            // network[j] уже разжата из bias в unbiasnet(), поэтому значения лежат в диапазоне 0..255.
+            // network[j] is already unbiased in unbiasnet() to 0..255.
             map[k++] = network[j][2].coerceIn(0, 255).toByte()
             map[k++] = network[j][1].coerceIn(0, 255).toByte()
             map[k++] = network[j][0].coerceIn(0, 255).toByte()
@@ -102,8 +102,8 @@ class NeuQuant(
 
     private fun learn() {
         if (lengthcount < 3) return
-        val length = lengthcount
-        val samplepixels = length / (3 * samplefac)
+        val length = (lengthcount / 3) * 3
+        val samplepixels = (length / (3 * samplefac)).coerceAtLeast(1)
         var delta = samplepixels / ncycles
         if (delta == 0) delta = 1
         var alpha = initalpha
@@ -114,7 +114,7 @@ class NeuQuant(
             radpower[i] = alpha * (((rad * rad - i * i) * radbias) / (rad * rad))
         }
 
-        var step = if (length < 499 * 3) 3
+        val step = if (length < 503 * 3) 3
         else if (length % 499 != 0) 499 * 3
         else if (length % 491 != 0) 491 * 3
         else if (length % 487 != 0) 487 * 3
@@ -123,10 +123,14 @@ class NeuQuant(
         var pix = 0
         var i = 0
         while (i < samplepixels) {
+            if (pix + 2 >= length) {
+                pix %= length
+                if (pix + 2 >= length) pix = 0
+            }
             val b = (thepicture[pix].toInt() and 0xff) shl netbiasshift
             val g = (thepicture[pix + 1].toInt() and 0xff) shl netbiasshift
             val r = (thepicture[pix + 2].toInt() and 0xff) shl netbiasshift
-            var j = contest(b, g, r)
+            val j = contest(b, g, r)
 
             altersingle(alpha, j, b, g, r)
             if (rad != 0) alterconv(rad, j, b, g, r)
@@ -135,7 +139,6 @@ class NeuQuant(
             if (pix >= length) pix -= length
 
             i++
-            if (delta == 0) delta = 1
             if (i % delta == 0) {
                 alpha -= alpha / 30
                 radius -= radius / radiusdec
@@ -151,13 +154,14 @@ class NeuQuant(
     fun map(b: Int, g: Int, r: Int): Int {
         var bestd = 1000
         var best = -1
-        var i = netindex[g]
+        val clampedG = g.coerceIn(0, 255)
+        var i = netindex[clampedG]
         var j = i - 1
 
         while (i < netsize || j >= 0) {
             if (i < netsize) {
                 val p = network[i]
-                var dist = p[1] - g
+                var dist = p[1] - clampedG
                 if (dist >= bestd) i = netsize
                 else {
                     i++
@@ -178,7 +182,7 @@ class NeuQuant(
             }
             if (j >= 0) {
                 val p = network[j]
-                var dist = g - p[1]
+                var dist = clampedG - p[1]
                 if (dist >= bestd) j = -1
                 else {
                     j--
@@ -198,7 +202,7 @@ class NeuQuant(
                 }
             }
         }
-        return best
+        return if (best in 0 until netsize) best else 0
     }
 
     fun process(): ByteArray {
@@ -210,9 +214,9 @@ class NeuQuant(
 
     private fun unbiasnet() {
         for (i in 0 until netsize) {
-            network[i][0] = network[i][0] shr netbiasshift
-            network[i][1] = network[i][1] shr netbiasshift
-            network[i][2] = network[i][2] shr netbiasshift
+            network[i][0] = (network[i][0] shr netbiasshift).coerceIn(0, 255)
+            network[i][1] = (network[i][1] shr netbiasshift).coerceIn(0, 255)
+            network[i][2] = (network[i][2] shr netbiasshift).coerceIn(0, 255)
             network[i][3] = i
         }
     }
@@ -256,12 +260,12 @@ class NeuQuant(
     private fun contest(b: Int, g: Int, r: Int): Int {
         var bestd = Int.MAX_VALUE
         var bestbiasd = bestd
-        var bestpos = -1
-        var bestbiaspos = bestpos
+        var bestpos = 0
+        var bestbiaspos = 0
 
         for (i in 0 until netsize) {
             val p = network[i]
-            var dist = abs(p[0] - b) + abs(p[1] - g) + abs(p[2] - r)
+            val dist = abs(p[0] - b) + abs(p[1] - g) + abs(p[2] - r)
             if (dist < bestd) {
                 bestd = dist
                 bestpos = i

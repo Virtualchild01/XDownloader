@@ -13,14 +13,16 @@ data class XFormatOption(
     val downloadUrl: String,
     val bitrate: Long = 0,
     val isGifConversion: Boolean = false,
-    val fileSizeFormatted: String = ""
+    val fileSizeFormatted: String = "",
+    val durationMs: Long = 0L
 )
 
 data class XMediaItem(
     val type: XMediaType,
     val previewUrl: String,
     val availableFormats: List<XFormatOption>,
-    val durationSeconds: Long = 0
+    val durationSeconds: Long = 0,
+    val durationMs: Long = 0L
 )
 
 data class XPostInfo(

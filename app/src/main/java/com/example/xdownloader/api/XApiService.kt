@@ -1,7 +1,6 @@
 package com.example.xdownloader.api
 
 import com.google.gson.Gson
-import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -43,7 +42,7 @@ class XApiService {
      */
     suspend fun getPostInfo(tweetId: String): Result<XPostInfo> = withContext(Dispatchers.IO) {
         try {
-            // Attempt 1: VxTwitter / FxTwitter public API (fast and returns structured media variants)
+            // Attempt 1: VxTwitter public API (fast and returns structured media variants + duration_millis)
             val vxtResult = fetchFromVxTwitter(tweetId)
             if (vxtResult != null && vxtResult.mediaItems.isNotEmpty()) {
                 return@withContext Result.success(vxtResult)
@@ -128,7 +127,8 @@ class XApiService {
                 val previewUrl = mObj.get("thumbnail_url")?.asString
                     ?: mObj.get("url")?.asString ?: ""
 
-                val durationSec = (mObj.get("duration_millis")?.asLong ?: 0L) / 1000L
+                val durationMs = mObj.get("duration_millis")?.asLong ?: 0L
+                val durationSec = durationMs / 1000L
 
                 val formats = mutableListOf<XFormatOption>()
 
@@ -136,6 +136,7 @@ class XApiService {
                     "video", "gif" -> {
                         val isNativeGif = mTypeStr == "gif"
                         var bestMp4Url = mObj.get("url")?.asString ?: ""
+                        var gifSourceMp4Url = bestMp4Url
 
                         if (mObj.has("variants") && mObj.get("variants").isJsonArray) {
                             val varArray = mObj.getAsJsonArray("variants")
@@ -153,59 +154,85 @@ class XApiService {
                                 }
                             }
 
-                            // Sort descending by bitrate
                             mp4Variants.sortByDescending { it.first }
 
                             if (mp4Variants.isNotEmpty()) {
                                 bestMp4Url = mp4Variants.first().second
+                                gifSourceMp4Url = mp4Variants.firstOrNull { it.first in 300_000L..1_600_000L }?.second
+                                    ?: bestMp4Url
                             }
 
-                            for ((index, item) in mp4Variants.withIndex()) {
-                                val bitrate = item.first
-                                val vUrl = item.second
-                                val qualityLabel = when {
-                                    bitrate > 1_500_000 -> "1080p (Full HD)"
-                                    bitrate > 700_000 -> "720p (HD)"
-                                    bitrate > 350_000 -> "480p (SD)"
-                                    bitrate > 0 -> "360p"
-                                    else -> if (index == 0) "Максимальное качество (MP4)" else "Стандартное качество (MP4)"
-                                }
+                            if (!isNativeGif) {
+                                for ((index, item) in mp4Variants.withIndex()) {
+                                    val bitrate = item.first
+                                    val vUrl = item.second
+                                    val qualityLabel = when {
+                                        bitrate > 1_500_000 -> "1080p (Full HD)"
+                                        bitrate > 700_000 -> "720p (HD)"
+                                        bitrate > 350_000 -> "480p (SD)"
+                                        bitrate > 0 -> "360p"
+                                        else -> if (index == 0) "Максимальное качество (MP4)" else "Стандартное качество (MP4)"
+                                    }
 
-                                formats.add(
-                                    XFormatOption(
-                                        id = "mp4_$index",
-                                        label = qualityLabel,
-                                        extension = "mp4",
-                                        downloadUrl = vUrl,
-                                        bitrate = bitrate,
-                                        isGifConversion = false
+                                    formats.add(
+                                        XFormatOption(
+                                            id = "mp4_$index",
+                                            label = qualityLabel,
+                                            extension = "mp4",
+                                            downloadUrl = vUrl,
+                                            bitrate = bitrate,
+                                            isGifConversion = false,
+                                            durationMs = durationMs
+                                        )
                                     )
-                                )
+                                }
                             }
-                        } else {
+                        } else if (!isNativeGif && bestMp4Url.isNotEmpty()) {
                             formats.add(
                                 XFormatOption(
                                     id = "mp4_main",
                                     label = "MP4 Видео (Оригинал)",
                                     extension = "mp4",
                                     downloadUrl = bestMp4Url,
-                                    isGifConversion = false
+                                    isGifConversion = false,
+                                    durationMs = durationMs
                                 )
                             )
                         }
 
-                        // ОБЯЗАТЕЛЬНО: Добавляем выбор формата GIF (первым, если это GIF-пост)
-                        val gifOption = XFormatOption(
-                            id = "gif_format",
-                            label = if (isNativeGif) "GIF (Оригинальная анимация .gif)" else "GIF (Конвертировать в анимацию .gif)",
-                            extension = "gif",
-                            downloadUrl = bestMp4Url,
-                            isGifConversion = true
-                        )
                         if (isNativeGif) {
-                            formats.add(0, gifOption)
-                        } else {
-                            formats.add(gifOption)
+                            // Для GIF-постов первым пунктом (по умолчанию) ставим скачивание чистого файла .gif!
+                            formats.add(
+                                XFormatOption(
+                                    id = "gif_format",
+                                    label = "GIF (Файл .gif — анимация)",
+                                    extension = "gif",
+                                    downloadUrl = bestMp4Url,
+                                    isGifConversion = true,
+                                    durationMs = durationMs
+                                )
+                            )
+                            formats.add(
+                                XFormatOption(
+                                    id = "mp4_gif_fast",
+                                    label = "MP4 (Видеофайл без конвертации)",
+                                    extension = "mp4",
+                                    downloadUrl = bestMp4Url,
+                                    isGifConversion = false,
+                                    durationMs = durationMs
+                                )
+                            )
+                        } else if (gifSourceMp4Url.isNotEmpty()) {
+                            formats.add(
+                                XFormatOption(
+                                    id = "gif_format",
+                                    label = "GIF (Конвертировать в .gif)",
+                                    extension = "gif",
+                                    downloadUrl = gifSourceMp4Url,
+                                    isGifConversion = true,
+                                    durationMs = durationMs
+                                )
+                            )
                         }
 
                         mediaList.add(
@@ -213,12 +240,12 @@ class XApiService {
                                 type = if (isNativeGif) XMediaType.GIF else XMediaType.VIDEO,
                                 previewUrl = previewUrl,
                                 availableFormats = formats,
-                                durationSeconds = durationSec
+                                durationSeconds = durationSec,
+                                durationMs = durationMs
                             )
                         )
                     }
                     else -> {
-                        // Photo
                         val photoUrl = mObj.get("url")?.asString ?: previewUrl
                         val origUrl = if (photoUrl.contains("twimg.com")) {
                             if (photoUrl.contains("?")) "${photoUrl.substringBefore("?")}?name=orig" else "$photoUrl?name=orig"
@@ -284,59 +311,94 @@ class XApiService {
                         if (mType == "video" || mType == "animated_gif") {
                             val isGif = mType == "animated_gif"
                             var bestUrl = ""
-                            if (mObj.has("video_info") && mObj.getAsJsonObject("video_info").has("variants")) {
-                                val variants = mObj.getAsJsonObject("video_info").getAsJsonArray("variants")
-                                val list = mutableListOf<Pair<Long, String>>()
+                            var gifSourceUrl = ""
+                            var durationMs = 0L
 
-                                for (v in variants) {
-                                    if (!v.isJsonObject) continue
-                                    val vObj = v.asJsonObject
-                                    val cType = vObj.get("content_type")?.asString ?: ""
-                                    val vUrl = vObj.get("url")?.asString ?: continue
-                                    val bitrate = vObj.get("bitrate")?.asLong ?: 0L
+                            if (mObj.has("video_info") && mObj.get("video_info").isJsonObject) {
+                                val videoInfo = mObj.getAsJsonObject("video_info")
+                                durationMs = videoInfo.get("duration_millis")?.asLong ?: 0L
 
-                                    if (cType.contains("mp4") || vUrl.contains(".mp4")) {
-                                        list.add(Pair(bitrate, vUrl))
+                                if (videoInfo.has("variants") && videoInfo.get("variants").isJsonArray) {
+                                    val variants = videoInfo.getAsJsonArray("variants")
+                                    val list = mutableListOf<Pair<Long, String>>()
+
+                                    for (v in variants) {
+                                        if (!v.isJsonObject) continue
+                                        val vObj = v.asJsonObject
+                                        val cType = vObj.get("content_type")?.asString ?: ""
+                                        val vUrl = vObj.get("url")?.asString ?: continue
+                                        val bitrate = vObj.get("bitrate")?.asLong ?: 0L
+
+                                        if (cType.contains("mp4") || vUrl.contains(".mp4")) {
+                                            list.add(Pair(bitrate, vUrl))
+                                        }
                                     }
-                                }
-                                list.sortByDescending { it.first }
+                                    list.sortByDescending { it.first }
 
-                                if (list.isNotEmpty()) {
-                                    bestUrl = list.first().second
-                                }
-
-                                for ((idx, item) in list.withIndex()) {
-                                    val label = when {
-                                        item.first > 1_500_000 -> "1080p (Full HD)"
-                                        item.first > 700_000 -> "720p (HD)"
-                                        item.first > 350_000 -> "480p"
-                                        item.first > 0 -> "360p"
-                                        else -> "Качество $idx"
+                                    if (list.isNotEmpty()) {
+                                        bestUrl = list.first().second
+                                        gifSourceUrl = list.firstOrNull { it.first in 300_000L..1_600_000L }?.second
+                                            ?: bestUrl
                                     }
-                                    formats.add(
-                                        XFormatOption(
-                                            id = "mp4_$idx",
-                                            label = label,
-                                            extension = "mp4",
-                                            downloadUrl = item.second,
-                                            bitrate = item.first
-                                        )
-                                    )
+
+                                    if (!isGif) {
+                                        for ((idx, item) in list.withIndex()) {
+                                            val label = when {
+                                                item.first > 1_500_000 -> "1080p (Full HD)"
+                                                item.first > 700_000 -> "720p (HD)"
+                                                item.first > 350_000 -> "480p (SD)"
+                                                item.first > 0 -> "360p"
+                                                else -> "Качество $idx"
+                                            }
+                                            formats.add(
+                                                XFormatOption(
+                                                    id = "mp4_$idx",
+                                                    label = label,
+                                                    extension = "mp4",
+                                                    downloadUrl = item.second,
+                                                    bitrate = item.first,
+                                                    isGifConversion = false,
+                                                    durationMs = durationMs
+                                                )
+                                            )
+                                        }
+                                    }
                                 }
                             }
 
                             if (bestUrl.isNotEmpty()) {
-                                val gifOption = XFormatOption(
-                                    id = "gif_format",
-                                    label = "GIF (Анимированный GIF)",
-                                    extension = "gif",
-                                    downloadUrl = bestUrl,
-                                    isGifConversion = true
-                                )
                                 if (isGif) {
-                                    formats.add(0, gifOption)
+                                    formats.add(
+                                        XFormatOption(
+                                            id = "gif_format",
+                                            label = "GIF (Файл .gif — анимация)",
+                                            extension = "gif",
+                                            downloadUrl = bestUrl,
+                                            isGifConversion = true,
+                                            durationMs = durationMs
+                                        )
+                                    )
+                                    formats.add(
+                                        XFormatOption(
+                                            id = "mp4_gif_fast",
+                                            label = "MP4 (Видеофайл без конвертации)",
+                                            extension = "mp4",
+                                            downloadUrl = bestUrl,
+                                            isGifConversion = false,
+                                            durationMs = durationMs
+                                        )
+                                    )
                                 } else {
-                                    formats.add(gifOption)
+                                    formats.add(
+                                        XFormatOption(
+                                            id = "gif_format",
+                                            label = "GIF (Конвертировать в .gif)",
+                                            extension = "gif",
+                                            downloadUrl = gifSourceUrl.ifEmpty { bestUrl },
+                                            isGifConversion = true,
+                                            durationMs = durationMs
+                                        )
+                                    )
                                 }
                             }
 
@@ -344,11 +406,12 @@ class XApiService {
                                 XMediaItem(
                                     type = if (isGif) XMediaType.GIF else XMediaType.VIDEO,
                                     previewUrl = previewUrl,
-                                    availableFormats = formats
+                                    availableFormats = formats,
+                                    durationSeconds = durationMs / 1000L,
+                                    durationMs = durationMs
                                 )
                             )
                         } else {
-                            // Photo
                             val origUrl = "$previewUrl?name=orig"
                             formats.add(
                                 XFormatOption(
