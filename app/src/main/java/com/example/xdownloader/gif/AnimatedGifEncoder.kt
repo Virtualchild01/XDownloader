@@ -1,42 +1,50 @@
 package com.example.xdownloader.gif
 
 import android.graphics.Bitmap
+import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.OutputStream
 import java.util.Arrays
-import kotlin.math.abs
 
 /**
- * High-speed Animated GIF89a Encoder with:
- * 1) Single Global Hybrid Palette (216 scene-adaptive histogram colors + 39 vivid chromatic anchors + 1 transparent slot 255)
- * 2) O(1) RGB555 lookup table (eliminating per-frame NeuQuant training and 256-step searches)
- * 3) Inter-frame Delta Transparency compression (dispose = 1, transIndex = 255 for unchanged background pixels),
- *    reducing file size by ~50-60% and accelerating encoding by 15-20x on High-Res (1080p/2160p) videos.
+ * Full-Frame Animated GIF89a Encoder:
+ * - Кодирует 100% пикселей каждого кадра (dispose = 0, без дельта-прозрачности и заморозки пикселей)
+ * - Использует 4x4 упорядоченный дизеринг Байера (Bayer Ordered Dithering) для идеальной плавности
+ *   микродвижений камеры, полутонов и освещения на каждом кадре (24-30 fps)
+ * - Хранит в памяти только одну строку пикселей (IntArray(width) ~ 7.6 КБ) и массив индексов,
+ *   полностью исключая риск OutOfMemoryError и пропуск кадров даже на разрешении 1920x2160.
  */
 class AnimatedGifEncoder {
     private var width: Int = 0
     private var height: Int = 0
-    private var repeat: Int = 0 // 0 = loop forever
-    private var delay: Int = 40 // frame delay in ms
+    private var repeat: Int = 0 // 0 = бесконечный цикл
+    private var delay: Int = 40 // задержка кадра в мс
     private var started: Boolean = false
     private var out: OutputStream? = null
     private var firstFrame: Boolean = true
+    private var paletteBuilt: Boolean = false
     private var sample: Int = 5
 
-    private val transIndex: Int = 255
     private var colorTab: ByteArray = ByteArray(256 * 3)
-    private val palR = IntArray(255)
-    private val palG = IntArray(255)
-    private val palB = IntArray(255)
+    private val palR = IntArray(256)
+    private val palG = IntArray(256)
+    private val palB = IntArray(256)
     private val rgb555Lut = IntArray(32768) { -1 }
 
-    private var rgbBuffer: IntArray = IntArray(0)
-    private var prevRgbBuffer: IntArray = IntArray(0)
-    private var prevPalBuffer: IntArray = IntArray(0)
+    private var rowBuffer: IntArray = IntArray(0)
     private var indexedPixels: ByteArray = ByteArray(0)
 
     companion object {
-        // 39 гарантированных насыщенных хроматических и базовых цветов (слоты 216..254),
+        // Матрица упорядоченного дизеринга Байера 4x4 (значения -4..+3)
+        // Обеспечивает плавную передачу субпиксельного движения камеры и градиентов от кадра к кадру
+        private val BAYER_4X4 = intArrayOf(
+            -4,  0, -3,  1,
+             2, -2,  3, -1,
+            -2,  1, -3,  0,
+             3,  0,  2, -1
+        )
+
+        // 39 гарантированных насыщенных хроматических и базовых цветов (слоты 217..255),
         // чтобы мелкие яркие детали (например, красные глаза, блики, неон) никогда не теряли цвет
         private val CHROMATIC_ANCHORS = arrayOf(
             intArrayOf(0, 0, 0), intArrayOf(255, 255, 255), intArrayOf(128, 128, 128),
@@ -86,6 +94,7 @@ class AnimatedGifEncoder {
         out = os
         started = true
         firstFrame = true
+        paletteBuilt = false
         return try {
             writeString("GIF89a")
             true
@@ -94,82 +103,91 @@ class AnimatedGifEncoder {
         }
     }
 
+    /**
+     * Инициализирует глобальную палитру из 256 цветов по первому кадру и записывает заголовок GIF (LSD + GCT + Netscape).
+     */
+    fun ensureHeaderAndPalette(im: Bitmap) {
+        if (paletteBuilt) return
+        width = im.width
+        height = im.height
+        val numPixels = width * height
+        if (rowBuffer.size < width) {
+            rowBuffer = IntArray(width)
+        }
+        if (indexedPixels.size != numPixels) {
+            indexedPixels = ByteArray(numPixels)
+        }
+        Arrays.fill(rgb555Lut, -1)
+
+        buildGlobalHybridPaletteFromBitmap(im)
+        writeLSD()
+        writePalette()
+        if (repeat >= 0) {
+            writeNetscapeExt()
+        }
+        paletteBuilt = true
+        firstFrame = false
+    }
+
+    /**
+     * Квантует кадр (100% пикселей с дизерингом Байера 4x4) и сжимает его в компактный LZW-массив байт.
+     * Позволяет хранить в буфере переупорядочивания B-кадров сжатые ~300 КБ вместо 16.6 МБ Bitmap!
+     */
+    fun encodeFrameToLzwBytes(im: Bitmap): ByteArray {
+        ensureHeaderAndPalette(im)
+        var frameBmp = im
+        if (im.width != width || im.height != height) {
+            frameBmp = Bitmap.createScaledBitmap(im, width, height, true)
+        }
+
+        quantizeBitmapToIndexedPixels(frameBmp)
+
+        if (frameBmp !== im) {
+            frameBmp.recycle()
+        }
+
+        val baos = ByteArrayOutputStream(width * height / 3)
+        val lzw = LZWEncoder(width, height, indexedPixels, 8)
+        lzw.encode(baos)
+        return baos.toByteArray()
+    }
+
+    /**
+     * Записывает ранее сжатый LZW-кадр в выходной GIF-поток с текущей задержкой delay.
+     */
+    fun writePreEncodedFrame(lzwBytes: ByteArray): Boolean {
+        if (!started || out == null || !paletteBuilt) return false
+        return try {
+            writeGraphicCtrlExt()
+            writeImageDesc()
+            out!!.write(lzwBytes)
+            true
+        } catch (e: IOException) {
+            false
+        }
+    }
+
+    /**
+     * Прямое добавление кадра в поток (используется для последовательной записи).
+     */
     fun addFrame(im: Bitmap): Boolean {
         if (!started || out == null) return false
         return try {
+            ensureHeaderAndPalette(im)
             var frameBmp = im
-            if (firstFrame) {
-                width = im.width
-                height = im.height
-                val numPixels = width * height
-                rgbBuffer = IntArray(numPixels)
-                prevRgbBuffer = IntArray(numPixels)
-                prevPalBuffer = IntArray(numPixels)
-                indexedPixels = ByteArray(numPixels)
-                Arrays.fill(rgb555Lut, -1)
-            } else if (im.width != width || im.height != height) {
+            if (im.width != width || im.height != height) {
                 frameBmp = Bitmap.createScaledBitmap(im, width, height, true)
             }
 
-            val numPixels = width * height
-            frameBmp.getPixels(rgbBuffer, 0, width, 0, 0, width, height)
+            quantizeBitmapToIndexedPixels(frameBmp)
+
             if (frameBmp !== im) {
                 frameBmp.recycle()
             }
 
-            if (firstFrame) {
-                buildGlobalHybridPalette(numPixels)
-                for (i in 0 until numPixels) {
-                    val c = rgbBuffer[i]
-                    val pIdx = lookupPaletteIndex(c)
-                    indexedPixels[i] = pIdx.toByte()
-                    prevPalBuffer[i] = pIdx
-                    prevRgbBuffer[i] = c
-                }
-
-                writeLSD()
-                writePalette()
-                if (repeat >= 0) {
-                    writeNetscapeExt()
-                }
-                writeGraphicCtrlExt(useTransparency = false)
-                writeImageDesc()
-                writePixels()
-                firstFrame = false
-            } else {
-                // Дельта-кодирование с прозрачностью (dispose = 1, transIndex = 255):
-                // неизменившиеся пиксели фона кодируются прозрачным индексом 255 и сжимаются LZW в десятки раз
-                for (i in 0 until numPixels) {
-                    val c = rgbBuffer[i]
-                    val prevC = prevRgbBuffer[i]
-                    if (c == prevC) {
-                        indexedPixels[i] = transIndex.toByte()
-                    } else {
-                        val pIdx = lookupPaletteIndex(c)
-                        if (pIdx == prevPalBuffer[i]) {
-                            indexedPixels[i] = transIndex.toByte()
-                        } else {
-                            val r = (c shr 16) and 0xFF
-                            val g = (c shr 8) and 0xFF
-                            val b = c and 0xFF
-                            val pr = (prevC shr 16) and 0xFF
-                            val pg = (prevC shr 8) and 0xFF
-                            val pb = prevC and 0xFF
-                            if (abs(r - pr) <= 5 && abs(g - pg) <= 5 && abs(b - pb) <= 5) {
-                                indexedPixels[i] = transIndex.toByte()
-                            } else {
-                                indexedPixels[i] = pIdx.toByte()
-                                prevPalBuffer[i] = pIdx
-                                prevRgbBuffer[i] = c
-                            }
-                        }
-                    }
-                }
-
-                writeGraphicCtrlExt(useTransparency = true)
-                writeImageDesc()
-                writePixels()
-            }
+            writeGraphicCtrlExt()
+            writeImageDesc()
+            writePixels()
             true
         } catch (e: IOException) {
             false
@@ -187,20 +205,55 @@ class AnimatedGifEncoder {
             ok = false
         }
         out = null
-        rgbBuffer = IntArray(0)
-        prevRgbBuffer = IntArray(0)
-        prevPalBuffer = IntArray(0)
+        rowBuffer = IntArray(0)
         indexedPixels = ByteArray(0)
         firstFrame = true
+        paletteBuilt = false
         return ok
     }
 
-    private fun buildGlobalHybridPalette(numPixels: Int) {
+    private fun quantizeBitmapToIndexedPixels(bmp: Bitmap) {
+        val w = width
+        val h = height
+        if (rowBuffer.size < w) {
+            rowBuffer = IntArray(w)
+        }
+        val row = rowBuffer
+        val outIdx = indexedPixels
+        var outPos = 0
+
+        for (y in 0 until h) {
+            bmp.getPixels(row, 0, w, 0, y, w, 1)
+            val bayerRowOffset = (y and 3) shl 2
+            for (x in 0 until w) {
+                val c = row[x]
+                val dither = BAYER_4X4[bayerRowOffset or (x and 3)]
+                val r = (((c shr 16) and 0xFF) + dither).coerceIn(0, 255)
+                val g = (((c shr 8) and 0xFF) + dither).coerceIn(0, 255)
+                val b = ((c and 0xFF) + dither).coerceIn(0, 255)
+                val bIdx = ((r shr 3) shl 10) or ((g shr 3) shl 5) or (b shr 3)
+                var pIdx = rgb555Lut[bIdx]
+                if (pIdx < 0) {
+                    pIdx = computeNearestSlot(bIdx)
+                }
+                outIdx[outPos++] = pIdx.toByte()
+            }
+        }
+    }
+
+    private fun buildGlobalHybridPaletteFromBitmap(bmp: Bitmap) {
         val counts = IntArray(32768)
-        for (i in 0 until numPixels) {
-            val c = rgbBuffer[i]
-            val bIdx = (((c shr 19) and 31) shl 10) or (((c shr 11) and 31) shl 5) or ((c shr 3) and 31)
-            counts[bIdx]++
+        val w = width
+        val h = height
+        val row = rowBuffer
+
+        for (y in 0 until h) {
+            bmp.getPixels(row, 0, w, 0, y, w, 1)
+            for (x in 0 until w) {
+                val c = row[x]
+                val bIdx = (((c shr 19) and 31) shl 10) or (((c shr 11) and 31) shl 5) or ((c shr 3) and 31)
+                counts[bIdx]++
+            }
         }
 
         val packed = LongArray(32768)
@@ -209,8 +262,8 @@ class AnimatedGifEncoder {
         }
         Arrays.sort(packed)
 
-        // Слоты 0..215: 216 самых частых оттенков сцены из первого кадра
-        for (slot in 0 until 216) {
+        // Слоты 0..216: 217 самых частых оттенков сцены из первого кадра
+        for (slot in 0 until 217) {
             val pk = packed[32767 - slot]
             val bIdx = (pk and 32767L).toInt()
             val r = ((bIdx shr 10) and 31) * 8 + 4
@@ -225,9 +278,9 @@ class AnimatedGifEncoder {
             rgb555Lut[bIdx] = slot
         }
 
-        // Слоты 216..254: 39 насыщенных хроматических акцентов (красные глаза, неон, базовые тона)
+        // Слоты 217..255: 39 насыщенных хроматических акцентов (красные глаза, неон, базовые тона)
         for (a in 0 until 39) {
-            val slot = 216 + a
+            val slot = 217 + a
             val anchor = CHROMATIC_ANCHORS[a]
             val r = anchor[0]
             val g = anchor[1]
@@ -243,24 +296,15 @@ class AnimatedGifEncoder {
                 rgb555Lut[bIdx] = slot
             }
         }
-
-        // Слот 255: прозрачный индекс для дельта-кодирования кадров
-        colorTab[255 * 3] = 0
-        colorTab[255 * 3 + 1] = 0
-        colorTab[255 * 3 + 2] = 0
     }
 
-    private fun lookupPaletteIndex(c: Int): Int {
-        val bIdx = (((c shr 19) and 31) shl 10) or (((c shr 11) and 31) shl 5) or ((c shr 3) and 31)
-        var pIdx = rgb555Lut[bIdx]
-        if (pIdx >= 0) return pIdx
-
+    private fun computeNearestSlot(bIdx: Int): Int {
         val r = ((bIdx shr 10) and 31) * 8 + 4
         val g = ((bIdx shr 5) and 31) * 8 + 4
         val b = (bIdx and 31) * 8 + 4
         var bestSlot = 0
         var bestDist = Int.MAX_VALUE
-        for (s in 0 until 255) {
+        for (s in 0 until 256) {
             val dr = r - palR[s]
             val dg = g - palG[s]
             val db = b - palB[s]
@@ -274,17 +318,14 @@ class AnimatedGifEncoder {
         return bestSlot
     }
 
-    private fun writeGraphicCtrlExt(useTransparency: Boolean) {
+    private fun writeGraphicCtrlExt() {
         out!!.write(0x21) // extension introducer
         out!!.write(0xf9) // GCE label
         out!!.write(4)    // byte size
-        val disp = 1 shl 2 // dispose = 1 (Do Not Dispose — оставлять пиксели предыдущего кадра)
-        val transp = if (useTransparency) 1 else 0
-
-        out!!.write(disp or transp)
-        writeShort((delay + 5) / 10) // delay in hundredths of a second (rounded)
-        out!!.write(transIndex)
-        out!!.write(0) // block terminator
+        out!!.write(0)    // dispose = 0, transp = 0 (полный кадр без пропуска пикселей)
+        writeShort((delay + 5) / 10) // задержка в сотых долях секунды (10 мс)
+        out!!.write(0)    // transparent index (не используется)
+        out!!.write(0)    // block terminator
     }
 
     private fun writeImageDesc() {
@@ -293,13 +334,13 @@ class AnimatedGifEncoder {
         writeShort(0)     // y position
         writeShort(width)
         writeShort(height)
-        out!!.write(0)    // LCT = 0 (все кадры используют единую глобальную таблицу цветов GCT)
+        out!!.write(0)    // LCT = 0 (используется глобальная таблица цветов GCT)
     }
 
     private fun writeLSD() {
         writeShort(width)
         writeShort(height)
-        out!!.write(0x80 or 0x70 or 0x00 or 7) // global color table flag, 256 colors (2^(7+1))
+        out!!.write(0x80 or 0x70 or 0x00 or 7) // global color table flag, 256 colors
         out!!.write(0) // background color index
         out!!.write(0) // pixel aspect ratio
     }

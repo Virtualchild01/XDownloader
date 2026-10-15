@@ -204,7 +204,6 @@ class XApiService {
                     "video", "gif" -> {
                         val isNativeGif = mTypeStr == "gif"
                         var bestMp4Url = mObj.get("url")?.asString ?: ""
-                        var mediumMp4Url = bestMp4Url
 
                         if (mObj.has("variants") && mObj.get("variants").isJsonArray) {
                             val varArray = mObj.getAsJsonArray("variants")
@@ -226,8 +225,6 @@ class XApiService {
 
                             if (mp4Variants.isNotEmpty()) {
                                 bestMp4Url = mp4Variants.first().second
-                                mediumMp4Url = mp4Variants.firstOrNull { it.first in 400_000L..1_500_000L }?.second
-                                    ?: bestMp4Url
                             }
 
                             if (!isNativeGif) {
@@ -338,7 +335,7 @@ class XApiService {
                                         id = "gif_format_fast",
                                         label = hdGifLabel,
                                         extension = "gif",
-                                        downloadUrl = mediumMp4Url,
+                                        downloadUrl = bestMp4Url,
                                         isGifConversion = true,
                                         durationMs = durationMs,
                                         targetGifMaxDim = 720
@@ -430,7 +427,6 @@ class XApiService {
                         if (mType == "video" || mType == "animated_gif") {
                             val isGif = mType == "animated_gif"
                             var bestUrl = ""
-                            var mediumUrl = ""
                             var durationMs = 0L
 
                             if (mObj.has("video_info") && mObj.get("video_info").isJsonObject) {
@@ -456,8 +452,6 @@ class XApiService {
 
                                     if (list.isNotEmpty()) {
                                         bestUrl = list.first().second
-                                        mediumUrl = list.firstOrNull { it.first in 400_000L..1_500_000L }?.second
-                                            ?: bestUrl
                                     }
 
                                     if (!isGif) {
@@ -551,7 +545,7 @@ class XApiService {
                                                 id = "gif_format_fast",
                                                 label = hdGifLabel,
                                                 extension = "gif",
-                                                downloadUrl = mediumUrl.ifEmpty { bestUrl },
+                                                downloadUrl = bestUrl,
                                                 isGifConversion = true,
                                                 durationMs = durationMs,
                                                 targetGifMaxDim = 720
