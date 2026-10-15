@@ -35,8 +35,15 @@ object DownloadUtil {
         extension: String
     ): Long {
         val sanitizedTitle = sanitizeFilename(title)
+        val sanitizedFormat = formatLabel
+            .replace('×', 'x')
+            .filter { it.isLetterOrDigit() || it == '_' || it == '-' || it == ' ' }
+            .trim()
+            .replace(Regex("\\s+"), "_")
+            .take(35)
+            .ifEmpty { "Media" }
         val ext = if (extension.startsWith(".")) extension else ".$extension"
-        val fileName = "X_${sanitizedTitle}_${formatLabel.replace(" ", "_").replace("(", "").replace(")", "")}$ext"
+        val fileName = "X_${sanitizedTitle}_${sanitizedFormat}$ext"
 
         val request = DownloadManager.Request(Uri.parse(url)).apply {
             setTitle("XDownloader: $title")
@@ -179,14 +186,22 @@ object DownloadUtil {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
                     put(MediaStore.MediaColumns.MIME_TYPE, "image/gif")
                     put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                    put(MediaStore.MediaColumns.SIZE, gifFile.length())
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
                 }
                 val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
                 if (uri != null) {
                     context.contentResolver.openOutputStream(uri)?.use { out ->
                         FileInputStream(gifFile).use { input ->
-                            input.copyTo(out)
+                            input.copyTo(out, 262144)
                         }
+                        out.flush()
                     }
+                    val updateValues = ContentValues().apply {
+                        put(MediaStore.MediaColumns.IS_PENDING, 0)
+                        put(MediaStore.MediaColumns.SIZE, gifFile.length())
+                    }
+                    context.contentResolver.update(uri, updateValues, null, null)
                 }
                 uri
             } else {
@@ -195,7 +210,8 @@ object DownloadUtil {
                 val targetFile = File(downloadsDir, fileName)
                 FileInputStream(gifFile).use { input ->
                     FileOutputStream(targetFile).use { output ->
-                        input.copyTo(output)
+                        input.copyTo(output, 262144)
+                        output.flush()
                     }
                 }
                 try {
@@ -211,6 +227,7 @@ object DownloadUtil {
     fun sanitizeFilename(name: String): String {
         return name.filter { it.isLetterOrDigit() || it == '_' || it == '-' || it == '.' || it == ' ' }
             .trim()
+            .replace(Regex("\\s+"), "_")
             .take(45)
             .ifEmpty { "Post" }
     }

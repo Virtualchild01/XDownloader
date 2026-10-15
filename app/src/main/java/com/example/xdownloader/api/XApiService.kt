@@ -204,6 +204,7 @@ class XApiService {
                     "video", "gif" -> {
                         val isNativeGif = mTypeStr == "gif"
                         var bestMp4Url = mObj.get("url")?.asString ?: ""
+                        var mediumMp4Url = bestMp4Url
 
                         if (mObj.has("variants") && mObj.get("variants").isJsonArray) {
                             val varArray = mObj.getAsJsonArray("variants")
@@ -225,6 +226,8 @@ class XApiService {
 
                             if (mp4Variants.isNotEmpty()) {
                                 bestMp4Url = mp4Variants.first().second
+                                mediumMp4Url = mp4Variants.firstOrNull { it.first in 400_000L..1_800_000L }?.second
+                                    ?: bestMp4Url
                             }
 
                             if (!isNativeGif) {
@@ -324,8 +327,12 @@ class XApiService {
                                 max(origDims.first, origDims.second) > 1280
 
                             if (needs720pOption) {
-                                val hdGifLabel = if (origDims != null) {
-                                    val hdDims = compute720pDimensions(origDims.first, origDims.second)
+                                val hdDims = extractDimensions(null, mediumMp4Url)?.let { d ->
+                                    compute720pDimensions(d.first, d.second)
+                                } ?: origDims?.let { d ->
+                                    compute720pDimensions(d.first, d.second)
+                                }
+                                val hdGifLabel = if (hdDims != null) {
                                     "GIF (HD 720p • ${hdDims.first}×${hdDims.second})"
                                 } else {
                                     "GIF (HD 720p • компактный)"
@@ -335,7 +342,7 @@ class XApiService {
                                         id = "gif_format_fast",
                                         label = hdGifLabel,
                                         extension = "gif",
-                                        downloadUrl = bestMp4Url,
+                                        downloadUrl = mediumMp4Url,
                                         isGifConversion = true,
                                         durationMs = durationMs,
                                         targetGifMaxDim = 720
@@ -427,6 +434,7 @@ class XApiService {
                         if (mType == "video" || mType == "animated_gif") {
                             val isGif = mType == "animated_gif"
                             var bestUrl = ""
+                            var mediumUrl = ""
                             var durationMs = 0L
 
                             if (mObj.has("video_info") && mObj.get("video_info").isJsonObject) {
@@ -452,6 +460,8 @@ class XApiService {
 
                                     if (list.isNotEmpty()) {
                                         bestUrl = list.first().second
+                                        mediumUrl = list.firstOrNull { it.first in 400_000L..1_800_000L }?.second
+                                            ?: bestUrl
                                     }
 
                                     if (!isGif) {
@@ -534,8 +544,13 @@ class XApiService {
                                         max(origDims.first, origDims.second) > 1280
 
                                     if (needs720pOption) {
-                                        val hdGifLabel = if (origDims != null) {
-                                            val hdDims = compute720pDimensions(origDims.first, origDims.second)
+                                        val fastUrl = mediumUrl.ifEmpty { bestUrl }
+                                        val hdDims = extractDimensions(null, fastUrl)?.let { d ->
+                                            compute720pDimensions(d.first, d.second)
+                                        } ?: origDims?.let { d ->
+                                            compute720pDimensions(d.first, d.second)
+                                        }
+                                        val hdGifLabel = if (hdDims != null) {
                                             "GIF (HD 720p • ${hdDims.first}×${hdDims.second})"
                                         } else {
                                             "GIF (HD 720p • компактный)"
@@ -545,7 +560,7 @@ class XApiService {
                                                 id = "gif_format_fast",
                                                 label = hdGifLabel,
                                                 extension = "gif",
-                                                downloadUrl = bestUrl,
+                                                downloadUrl = fastUrl,
                                                 isGifConversion = true,
                                                 durationMs = durationMs,
                                                 targetGifMaxDim = 720

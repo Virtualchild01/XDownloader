@@ -24,9 +24,9 @@ import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.io.OutputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
+import java.util.ArrayDeque
 import java.util.Arrays
 import java.util.TreeMap
 import kotlin.math.max
@@ -41,16 +41,11 @@ object GifConverter {
     )
 
     /**
-     * Переиспользуемые буферы декодера JCodec.
-     * Полностью исключают выделение 45 МБ новых массивов на каждом кадре 1920x2160 и предотвращают OutOfMemoryError!
+     * Масштабирует Bitmap до targetShortSide (720p) БЕЗ автоматического вызова recycle() на исходном bitmap,
+     * чтобы вызывающий код мог безопасно хранить lastValid без риска IllegalStateException (recycled bitmap)!
      */
-    private class JCodecReusableBuffers {
-        var rgbPic: Picture? = null
-        var pixels: IntArray = IntArray(0)
-    }
-
-    private fun scaleBitmapIfNeeded(bitmap: Bitmap, targetShortSide: Int): Bitmap {
-        if (targetShortSide <= 0) return bitmap
+    private fun scaleBitmapSafe(bitmap: Bitmap, targetShortSide: Int): Bitmap {
+        if (targetShortSide <= 0 || bitmap.isRecycled) return bitmap
         val w = bitmap.width
         val h = bitmap.height
         val minSide = min(w, h)
@@ -62,17 +57,93 @@ object GifConverter {
         val newH = (((h * scale).toInt() + 1) / 2 * 2).coerceAtLeast(2)
         if (newW == w && newH == h) return bitmap
 
-        val scaled = Bitmap.createScaledBitmap(bitmap, newW, newH, true)
-        if (scaled != bitmap) bitmap.recycle()
-        return scaled
+        return try {
+            Bitmap.createScaledBitmap(bitmap, newW, newH, true)
+        } catch (e: Throwable) {
+            bitmap
+        }
+    }
+
+    /**
+     * Проверяет целостность созданного GIF-файла:
+     * - ненулевой размер (> 800 байт)
+     * - корректный заголовок "GIF89a"
+     * - корректный завершающий байт 0x3B (';')
+     */
+    private fun isValidGifFile(file: File): Boolean {
+        if (!file.exists() || file.length() <= 800L) return false
+        var raf: RandomAccessFile? = null
+        return try {
+            raf = RandomAccessFile(file, "r")
+            val hdr = ByteArray(6)
+            if (raf.read(hdr) != 6) return false
+            val headerStr = String(hdr, Charsets.US_ASCII)
+            if (headerStr != "GIF89a" && headerStr != "GIF87a") return false
+            raf.seek(raf.length() - 1L)
+            val lastByte = raf.read()
+            lastByte == 0x3B
+        } catch (e: Throwable) {
+            false
+        } finally {
+            try { raf?.close() } catch (ignored: Throwable) {}
+        }
+    }
+
+    /**
+     * Выполняет попытку кодирования GIF в изолированный временный файл tempGifFile.
+     * Если декодер выбросил исключение или вернул 0 кадров, временный файл немедленно очищается,
+     * чтобы следующий резервный декодер никогда не дописывал байты поверх оборванного потока!
+     */
+    private fun runIsolatedEncoderAttempt(
+        tempGifFile: File,
+        block: (AnimatedGifEncoder) -> Int
+    ): Int {
+        var bufferedOut: BufferedOutputStream? = null
+        return try {
+            if (tempGifFile.exists()) tempGifFile.delete()
+            bufferedOut = BufferedOutputStream(FileOutputStream(tempGifFile, false), 262144)
+            val encoder = AnimatedGifEncoder()
+            encoder.setDelay(40)
+            encoder.setRepeat(0)
+            encoder.setQuality(5)
+            if (!encoder.start(bufferedOut)) {
+                try { bufferedOut.close() } catch (ignored: Throwable) {}
+                if (tempGifFile.exists()) tempGifFile.delete()
+                return 0
+            }
+
+            val frames = block(encoder)
+            if (frames > 0) {
+                encoder.finish()
+                bufferedOut.flush()
+                bufferedOut.close()
+                bufferedOut = null
+                if (isValidGifFile(tempGifFile)) {
+                    frames
+                } else {
+                    if (tempGifFile.exists()) tempGifFile.delete()
+                    0
+                }
+            } else {
+                try { bufferedOut.close() } catch (ignored: Throwable) {}
+                bufferedOut = null
+                if (tempGifFile.exists()) tempGifFile.delete()
+                0
+            }
+        } catch (e: Throwable) {
+            e.printStackTrace()
+            try { bufferedOut?.close() } catch (ignored: Throwable) {}
+            if (tempGifFile.exists()) tempGifFile.delete()
+            0
+        }
     }
 
     /**
      * Конвертирует локальный видеофайл MP4 в плавный анимированный GIF:
      * - Сохраняет 100% кадров (полные 24/25/30 fps без урезания частоты кадров)
      * - Упорядочивает двунаправленные B-кадры H.264 строго по времени показа (PTS = DTS + CTTS)
-     * - Сжимает каждый декодированный кадр в LZW на лету и освобождает Bitmap немедленно,
-     *   гарантируя нулевые потери кадров даже на огромных 1920x2160 видеороликах.
+     * - Кодирует в изолированный проверенный временный файл и только после проверки целостности
+     *   (GIF89a ... 0x3B) публикует готовый файл в папку «Загрузки» (MediaStore.Downloads).
      */
     suspend fun convertVideoToGif(
         context: Context,
@@ -99,116 +170,86 @@ object GifConverter {
         val safeTitle = targetTitle
             .filter { it.isLetterOrDigit() || it == '_' || it == '-' || it == '.' || it == ' ' }
             .trim()
+            .replace(Regex("\\s+"), "_")
             .take(45)
             .ifEmpty { "X_Post" }
-        val fileName = safeTitle + "_anim.gif"
+        val fileName = "${safeTitle}_anim.gif"
 
-        var outputUri: Uri? = null
-        var rawOutStream: OutputStream? = null
-        var bufferedOut: BufferedOutputStream? = null
-        var targetFile: File? = null
+        val tempGifFile = File(context.cacheDir, "temp_gif_${System.currentTimeMillis()}.gif")
+        val totalTargetFrames = maxDurationSec * 32
+        val diagLog = StringBuilder()
+        var framesAdded = 0
 
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                    put(MediaStore.MediaColumns.MIME_TYPE, "image/gif")
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
-                    put(MediaStore.MediaColumns.IS_PENDING, 1)
-                }
-                outputUri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                if (outputUri != null) {
-                    rawOutStream = context.contentResolver.openOutputStream(outputUri)
-                }
-            } else {
-                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                if (!downloadsDir.exists()) downloadsDir.mkdirs()
-                targetFile = File(downloadsDir, fileName)
-                rawOutStream = FileOutputStream(targetFile)
-                outputUri = Uri.fromFile(targetFile)
-            }
-
-            if (rawOutStream == null) {
-                return@withContext Pair(null, "Не удалось создать файл в Загрузках")
-            }
-
-            bufferedOut = BufferedOutputStream(rawOutStream, 262144)
-
-            val encoder = AnimatedGifEncoder()
-            encoder.setDelay(40)
-            encoder.setRepeat(0)
-            encoder.setQuality(5)
-            encoder.start(bufferedOut)
-
-            var framesAdded = 0
-            val totalTargetFrames = maxDurationSec * 32
-            val diagLog = StringBuilder()
-
-            // УРОВЕНЬ 1 (Основной): Потоковый декодер JCodec с переупорядочиванием B-кадров (stts + ctts -> PTS)
-            try {
-                framesAdded = extractWithJCodec(
-                    videoFile = videoFile,
-                    expectedDurationMs = expectedDurationMs,
-                    maxDurationSec = maxDurationSec,
-                    maxFrames = totalTargetFrames,
-                    targetWidth = maxDimension,
-                    encoder = encoder,
-                    onProgress = onProgress
-                )
-            } catch (e: Throwable) {
-                diagLog.append("JCodec: ").append(e.message ?: e.javaClass.simpleName).append("; ")
-            }
-
-            // УРОВЕНЬ 2 (Резервный): MediaMetadataRetriever
-            if (framesAdded == 0) {
+            // УРОВЕНЬ 1 (Основной): Прямой потоковый декодер JCodec (без Bitmap, с пулом буферов и PTS-порядком)
+            framesAdded = runIsolatedEncoderAttempt(tempGifFile) { encoder ->
                 try {
-                    framesAdded = extractWithRetriever(
-                        context = context,
+                    extractWithJCodec(
                         videoFile = videoFile,
                         expectedDurationMs = expectedDurationMs,
                         maxDurationSec = maxDurationSec,
-                        fps = fps,
-                        maxDimension = maxDimension,
+                        maxFrames = totalTargetFrames,
+                        targetWidth = maxDimension,
                         encoder = encoder,
-                        diagLog = diagLog
-                    ) { p ->
-                        kotlinx.coroutines.runBlocking(Dispatchers.Main) {
-                            onProgress(p)
-                        }
-                    }
+                        onProgress = onProgress
+                    )
                 } catch (e: Throwable) {
-                    diagLog.append("MMR: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+                    diagLog.append("JCodec: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+                    0
                 }
             }
 
-            // УРОВЕНЬ 3 (Резервный): Glide Video Frame Loader
+            // УРОВЕНЬ 2 (Резервный): Системный MediaMetadataRetriever в чистый временный файл
             if (framesAdded == 0) {
-                try {
-                    framesAdded = extractWithGlide(
-                        context = context,
-                        videoFile = videoFile,
-                        expectedDurationMs = expectedDurationMs,
-                        maxDurationSec = maxDurationSec,
-                        fps = fps,
-                        maxDimension = maxDimension,
-                        encoder = encoder
-                    ) { p ->
-                        kotlinx.coroutines.runBlocking(Dispatchers.Main) {
-                            onProgress(p)
+                framesAdded = runIsolatedEncoderAttempt(tempGifFile) { encoder ->
+                    try {
+                        extractWithRetriever(
+                            context = context,
+                            videoFile = videoFile,
+                            expectedDurationMs = expectedDurationMs,
+                            maxDurationSec = maxDurationSec,
+                            fps = fps,
+                            maxDimension = maxDimension,
+                            encoder = encoder,
+                            diagLog = diagLog
+                        ) { p ->
+                            kotlinx.coroutines.runBlocking(Dispatchers.Main) {
+                                onProgress(p)
+                            }
                         }
+                    } catch (e: Throwable) {
+                        diagLog.append("MMR: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+                        0
                     }
-                } catch (e: Throwable) {
-                    diagLog.append("Glide: ").append(e.message ?: e.javaClass.simpleName).append("; ")
                 }
             }
 
+            // УРОВЕНЬ 3 (Резервный): Декодер кадров Glide (с отключённым HARDWARE config) в чистый временный файл
             if (framesAdded == 0) {
-                try { bufferedOut.close() } catch (ignored: Throwable) {}
-                if (outputUri != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    try { context.contentResolver.delete(outputUri, null, null) } catch (ignored: Throwable) {}
-                } else if (targetFile != null && targetFile.exists()) {
-                    targetFile.delete()
+                framesAdded = runIsolatedEncoderAttempt(tempGifFile) { encoder ->
+                    try {
+                        extractWithGlide(
+                            context = context,
+                            videoFile = videoFile,
+                            expectedDurationMs = expectedDurationMs,
+                            maxDurationSec = maxDurationSec,
+                            fps = fps,
+                            maxDimension = maxDimension,
+                            encoder = encoder
+                        ) { p ->
+                            kotlinx.coroutines.runBlocking(Dispatchers.Main) {
+                                onProgress(p)
+                            }
+                        }
+                    } catch (e: Throwable) {
+                        diagLog.append("Glide: ").append(e.message ?: e.javaClass.simpleName).append("; ")
+                        0
+                    }
                 }
+            }
+
+            if (framesAdded == 0 || !isValidGifFile(tempGifFile)) {
+                if (tempGifFile.exists()) tempGifFile.delete()
                 val msg = if (diagLog.isNotBlank()) {
                     "Сбой декодирования (" + diagLog.toString().trim() + ", размер: " + videoFile.length() + " Б)"
                 } else {
@@ -217,35 +258,105 @@ object GifConverter {
                 return@withContext Pair(null, msg)
             }
 
-            encoder.finish()
-            bufferedOut.flush()
-            bufferedOut.close()
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && outputUri != null) {
-                val updateValues = ContentValues().apply {
-                    put(MediaStore.MediaColumns.IS_PENDING, 0)
-                }
-                context.contentResolver.update(outputUri, updateValues, null, null)
-            } else if (targetFile != null) {
-                try {
-                    MediaScannerConnection.scanFile(context, arrayOf(targetFile.absolutePath), arrayOf("image/gif"), null)
-                } catch (ignored: Throwable) {}
+            // Копируем проверенный целостный GIF-файл в системную папку «Загрузки»
+            val savedUri = publishVerifiedGifToDownloads(context, tempGifFile, fileName)
+            if (savedUri == null) {
+                return@withContext Pair(null, "Не удалось сохранить готовый GIF в папку Загрузки")
             }
 
             withContext(Dispatchers.Main) {
                 onProgress(100)
             }
 
-            Pair(outputUri, null)
+            Pair(savedUri, null)
         } catch (e: Exception) {
             e.printStackTrace()
-            try { bufferedOut?.close() } catch (ignored: Throwable) {}
+            Pair(null, e.message ?: "Сбой при конвертации")
+        } finally {
+            if (tempGifFile.exists()) {
+                tempGifFile.delete()
+            }
+        }
+    }
+
+    /**
+     * Записывает уже полностью готовый и проверенный GIF-файл в системную папку «Загрузки» (MediaStore / Downloads)
+     * и запускает индексацию MediaScanner для мгновенного открытия в Галерее.
+     */
+    private fun publishVerifiedGifToDownloads(
+        context: Context,
+        verifiedGifFile: File,
+        fileName: String
+    ): Uri? {
+        var outputUri: Uri? = null
+        var targetFile: File? = null
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "image/gif")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                    put(MediaStore.MediaColumns.SIZE, verifiedGifFile.length())
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                }
+                outputUri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                if (outputUri == null) return null
+
+                context.contentResolver.openOutputStream(outputUri)?.use { out ->
+                    FileInputStream(verifiedGifFile).use { input ->
+                        input.copyTo(out, 262144)
+                    }
+                    out.flush()
+                } ?: return null
+
+                val updateValues = ContentValues().apply {
+                    put(MediaStore.MediaColumns.IS_PENDING, 0)
+                    put(MediaStore.MediaColumns.SIZE, verifiedGifFile.length())
+                }
+                context.contentResolver.update(outputUri, updateValues, null, null)
+
+                try {
+                    val pubFile = File(
+                        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                        fileName
+                    )
+                    MediaScannerConnection.scanFile(
+                        context,
+                        arrayOf(pubFile.absolutePath),
+                        arrayOf("image/gif"),
+                        null
+                    )
+                } catch (ignored: Throwable) {}
+
+                outputUri
+            } else {
+                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                if (!downloadsDir.exists()) downloadsDir.mkdirs()
+                targetFile = File(downloadsDir, fileName)
+                FileInputStream(verifiedGifFile).use { input ->
+                    BufferedOutputStream(FileOutputStream(targetFile, false), 262144).use { output ->
+                        input.copyTo(output, 262144)
+                        output.flush()
+                    }
+                }
+                try {
+                    MediaScannerConnection.scanFile(
+                        context,
+                        arrayOf(targetFile.absolutePath),
+                        arrayOf("image/gif"),
+                        null
+                    )
+                } catch (ignored: Throwable) {}
+                Uri.fromFile(targetFile)
+            }
+        } catch (e: Throwable) {
+            e.printStackTrace()
             if (outputUri != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 try { context.contentResolver.delete(outputUri, null, null) } catch (ignored: Throwable) {}
             } else if (targetFile != null && targetFile.exists()) {
                 targetFile.delete()
             }
-            Pair(null, e.message ?: "Сбой при конвертации")
+            null
         }
     }
 
@@ -285,33 +396,29 @@ object GifConverter {
                 var sttsPos = -1
                 var cttsPos = -1
 
-                for (i in 4 until (read - 36)) {
+                for (i in 0 until (read - 36)) {
                     val tag = bb.getInt(i)
                     // 'mvhd' = 0x6D766864
                     if (tag == 0x6D766864 && durationMs <= 0L) {
                         val version = buf[i + 4].toInt() and 0xFF
-                        val flags = bb.getInt(i + 4) and 0x00FFFFFF
-                        if (flags == 0 && (version == 0 || version == 1)) {
-                            val timescale: Long
-                            val duration: Long
-                            if (version == 0) {
-                                timescale = bb.getInt(i + 16).toLong() and 0xFFFFFFFFL
-                                duration = bb.getInt(i + 20).toLong() and 0xFFFFFFFFL
-                            } else {
-                                timescale = bb.getInt(i + 24).toLong() and 0xFFFFFFFFL
-                                duration = bb.getLong(i + 28)
-                            }
-                            if (timescale > 0L && duration > 0L && duration < timescale * 36000L) {
-                                durationMs = (duration * 1000L) / timescale
-                            }
+                        val timescale: Long
+                        val duration: Long
+                        if (version == 0) {
+                            timescale = bb.getInt(i + 16).toLong() and 0xFFFFFFFFL
+                            duration = bb.getInt(i + 20).toLong() and 0xFFFFFFFFL
+                        } else if (version == 1) {
+                            timescale = bb.getInt(i + 24).toLong() and 0xFFFFFFFFL
+                            duration = bb.getLong(i + 28)
+                        } else {
+                            continue
+                        }
+                        if (timescale > 0L && duration > 0L && duration < timescale * 36000L) {
+                            durationMs = (duration * 1000L) / timescale
                         }
                     }
                     // 'trak' = 0x7472616B
                     if (tag == 0x7472616B) {
-                        val boxSize = bb.getInt(i - 4)
-                        if (boxSize in 64..read) {
-                            inVideoTrack = false
-                        }
+                        inVideoTrack = false
                     }
                     // 'vide' = 0x76696465
                     if (tag == 0x76696465) {
@@ -324,28 +431,18 @@ object GifConverter {
                     if (inVideoTrack) {
                         // 'stsz' = 0x7374737A
                         if (tag == 0x7374737A && videoFrames <= 0) {
-                            val vf = bb.getInt(i + 4)
-                            if (vf == 0) {
-                                val count = bb.getInt(i + 12)
-                                if (count in 1..100000) {
-                                    videoFrames = count
-                                }
+                            val count = bb.getInt(i + 12)
+                            if (count in 1..100000) {
+                                videoFrames = count
                             }
                         }
                         // 'stts' = 0x73747473
                         if (tag == 0x73747473 && sttsPos == -1) {
-                            val vf = bb.getInt(i + 4)
-                            if (vf == 0) {
-                                sttsPos = i
-                            }
+                            sttsPos = i
                         }
                         // 'ctts' = 0x63747473
                         if (tag == 0x63747473 && cttsPos == -1) {
-                            val flags = bb.getInt(i + 4) and 0x00FFFFFF
-                            val ver = buf[i + 4].toInt() and 0xFF
-                            if (flags == 0 && (ver == 0 || ver == 1)) {
-                                cttsPos = i
-                            }
+                            cttsPos = i
                         }
                     }
                 }
@@ -429,9 +526,8 @@ object GifConverter {
 
     /**
      * Потоковое декодирование видео через JCodec с переупорядочиванием B-кадров в строгий PTS порядок.
-     * Для всех роликов <= 50 кадр/с сохраняются 100% кадров (24/25/30 fps без пропусков!).
-     * В буфере переупорядочивания хранятся уже сжатые LZW-байты (~300 КБ), а не 16.6 МБ Bitmap,
-     * что полностью исключает нехватку памяти и потерю кадров.
+     * Работает напрямую с RGB-байтами кадра и пулом переиспользуемых ByteArray(outW * outH),
+     * не создавая ни одного Bitmap (0 МБ лишних аллокаций) и сохраняя 100% кадров (24/25/30 fps).
      */
     private fun extractWithJCodec(
         videoFile: File,
@@ -443,7 +539,7 @@ object GifConverter {
         onProgress: (Int) -> Unit
     ): Int {
         var channel: SeekableByteChannel? = null
-        val buffers = JCodecReusableBuffers()
+        var reusableRgbPic: Picture? = null
 
         try {
             val meta = parseMp4Meta(videoFile)
@@ -477,15 +573,14 @@ object GifConverter {
                 }
 
                 // Сохраняем 100% кадров для всех роликов 24, 25 и 30 fps (step = 1)!
-                // Только для 60 fps роликов берём каждый 2-й кадр (плавные 30 fps).
                 val originalFps = (totalRawToRead * 1000.0) / clipDurationMs
                 val step = if (originalFps > 50.0) 2 else 1
 
                 val totalFramesToEncode = ((totalRawToRead + step - 1) / step).coerceAtLeast(1)
                 encoder.setRepeat(0)
 
-                // Буфер переупорядочивания хранит сжатые LZW-байты кадра (~300 КБ), а не гигантские Bitmap!
                 val reorderBuffer = TreeMap<Int, ByteArray>()
+                val framePool = ArrayDeque<ByteArray>()
                 var readCount = 0
                 var nextGifOrderToEmit = 0
                 var encodedCount = 0
@@ -493,33 +588,49 @@ object GifConverter {
                 val maxReadLimit = min(meta.videoFrames, totalRawToRead + 8)
 
                 while (readCount < maxReadLimit) {
-                    val pic: Picture = grab.nativeFrame ?: break
+                    val pic: Picture = try {
+                        grab.nativeFrame
+                    } catch (e: Throwable) {
+                        null
+                    } ?: break
+
                     val dispIdx = if (readCount < meta.displayRank.size) meta.displayRank[readCount] else readCount
 
                     if (dispIdx < totalRawToRead && dispIdx % step == 0) {
                         val gifOrder = dispIdx / step
-                        val bitmap = jcodecPictureToBitmap(pic, targetWidth, buffers)
-                        if (bitmap != null) {
-                            val lzwBytes = encoder.encodeFrameToLzwBytes(bitmap)
-                            bitmap.recycle()
-                            reorderBuffer.put(gifOrder, lzwBytes)
+                        val rgbPic = convertPictureToRgb(pic, reusableRgbPic)
+                        if (rgbPic != null) {
+                            if (rgbPic !== pic) reusableRgbPic = rgbPic
+                            val indices = quantizePictureDirect(
+                                src = pic,
+                                rgbPic = rgbPic,
+                                targetShortSide = targetWidth,
+                                encoder = encoder,
+                                framePool = framePool
+                            )
+                            if (indices != null) {
+                                val prev = reorderBuffer.put(gifOrder, indices)
+                                if (prev != null) framePool.addLast(prev)
+                            }
                         }
                     }
 
                     // Выдаём в GIF-поток кадры строго по порядку возрастания gifOrder (0, 1, 2, 3...)
                     while (reorderBuffer.isNotEmpty()) {
                         val firstKey = reorderBuffer.firstKey()
-                        if (firstKey <= nextGifOrderToEmit || reorderBuffer.size > 16) {
+                        if (firstKey <= nextGifOrderToEmit || reorderBuffer.size > 8) {
                             val entry = reorderBuffer.pollFirstEntry()!!
-                            val lzwBytes = entry.value
+                            val frameIndices = entry.value
 
                             val startCs = Math.round((encodedCount * clipDurationMs) / (10.0 * totalFramesToEncode)).toInt()
                             val endCs = Math.round(((encodedCount + 1) * clipDurationMs) / (10.0 * totalFramesToEncode)).toInt()
                             val delayCs = (endCs - startCs).coerceIn(2, 100)
                             encoder.setDelay(delayCs * 10)
 
-                            encoder.writePreEncodedFrame(lzwBytes)
-                            encodedCount++
+                            if (encoder.writeQuantizedFrame(frameIndices)) {
+                                encodedCount++
+                            }
+                            framePool.addLast(frameIndices)
                             nextGifOrderToEmit = entry.key + 1
 
                             val p = (35 + (encodedCount * 60 / totalFramesToEncode)).coerceIn(35, 95)
@@ -537,15 +648,17 @@ object GifConverter {
                 // Дозаписываем оставшиеся в буфере кадры в строгом хронологическом порядке
                 while (reorderBuffer.isNotEmpty()) {
                     val entry = reorderBuffer.pollFirstEntry()!!
-                    val lzwBytes = entry.value
+                    val frameIndices = entry.value
 
                     val startCs = Math.round((encodedCount * clipDurationMs) / (10.0 * totalFramesToEncode)).toInt()
                     val endCs = Math.round(((encodedCount + 1) * clipDurationMs) / (10.0 * totalFramesToEncode)).toInt()
                     val delayCs = (endCs - startCs).coerceIn(2, 100)
                     encoder.setDelay(delayCs * 10)
 
-                    encoder.writePreEncodedFrame(lzwBytes)
-                    encodedCount++
+                    if (encoder.writeQuantizedFrame(frameIndices)) {
+                        encodedCount++
+                    }
+                    framePool.addLast(frameIndices)
 
                     val p = (35 + (encodedCount * 60 / totalFramesToEncode)).coerceIn(35, 95)
                     kotlinx.coroutines.runBlocking(Dispatchers.Main) {
@@ -553,94 +666,86 @@ object GifConverter {
                     }
                 }
 
+                framePool.clear()
                 return encodedCount
             }
 
-            // Резервный потоковый режим, если в MP4 нестандартный заголовок
-            val compressedFrames = mutableListOf<ByteArray>()
-            var readCount = 0
-            while (readCount < maxFrames) {
-                val pic: Picture = grab.nativeFrame ?: break
-                val bitmap = jcodecPictureToBitmap(pic, targetWidth, buffers)
-                if (bitmap != null) {
-                    val lzwBytes = encoder.encodeFrameToLzwBytes(bitmap)
-                    bitmap.recycle()
-                    compressedFrames.add(lzwBytes)
-                }
-                readCount++
-            }
-
-            if (compressedFrames.isEmpty()) return 0
-
-            val clipDurationMs = if (fullVideoDurationMs > 0L) {
+            // Резервный потоковый режим JCodec, если в MP4 нестандартный заголовок
+            val framePool = ArrayDeque<ByteArray>()
+            var encodedCount = 0
+            val estDurationMs = if (fullVideoDurationMs > 0L) {
                 min(fullVideoDurationMs, maxDurationSec * 1000L).coerceAtLeast(200L)
             } else {
-                ((readCount * 1000L) / 24L).coerceAtLeast(200L)
+                3000L
             }
-
-            val currentFps = (compressedFrames.size * 1000.0) / clipDurationMs
-            val postStep = if (currentFps > 50.0) 2 else 1
-
-            val framesToWrite = mutableListOf<ByteArray>()
-            for ((index, bytes) in compressedFrames.withIndex()) {
-                if (index % postStep == 0) {
-                    framesToWrite.add(bytes)
-                }
-            }
-
-            val totalFrames = framesToWrite.size
-            if (totalFrames == 0) return 0
-
             encoder.setRepeat(0)
-            for ((index, lzwBytes) in framesToWrite.withIndex()) {
-                val startCs = Math.round((index * clipDurationMs) / (10.0 * totalFrames)).toInt()
-                val endCs = Math.round(((index + 1) * clipDurationMs) / (10.0 * totalFrames)).toInt()
-                val delayCs = (endCs - startCs).coerceIn(2, 100)
-                encoder.setDelay(delayCs * 10)
+            encoder.setDelay(40)
 
-                encoder.writePreEncodedFrame(lzwBytes)
+            while (encodedCount < maxFrames) {
+                val pic: Picture = try {
+                    grab.nativeFrame
+                } catch (e: Throwable) {
+                    null
+                } ?: break
 
-                val p = 35 + ((index + 1) * 60 / totalFrames)
-                kotlinx.coroutines.runBlocking(Dispatchers.Main) {
-                    onProgress(p)
+                val rgbPic = convertPictureToRgb(pic, reusableRgbPic)
+                if (rgbPic != null) {
+                    if (rgbPic !== pic) reusableRgbPic = rgbPic
+                    val indices = quantizePictureDirect(
+                        src = pic,
+                        rgbPic = rgbPic,
+                        targetShortSide = targetWidth,
+                        encoder = encoder,
+                        framePool = framePool
+                    )
+                    if (indices != null) {
+                        if (encoder.writeQuantizedFrame(indices)) {
+                            encodedCount++
+                        }
+                        framePool.addLast(indices)
+                        val estTotal = ((estDurationMs * 24L) / 1000L).toInt().coerceAtLeast(10)
+                        val p = (35 + (encodedCount * 60 / estTotal)).coerceIn(35, 95)
+                        kotlinx.coroutines.runBlocking(Dispatchers.Main) {
+                            onProgress(p)
+                        }
+                    }
                 }
             }
-            return totalFrames
+            framePool.clear()
+            return encodedCount
         } finally {
-            buffers.rgbPic = null
-            buffers.pixels = IntArray(0)
+            reusableRgbPic = null
             try { NIOUtils.closeQuietly(channel) } catch (ignored: Throwable) {}
         }
     }
 
-    /**
-     * Конвертация Picture из JCodec 0.2.5 в Android ARGB_8888 Bitmap с переиспользованием буферов памяти.
-     * Если задан режим HD 720p (targetShortSide > 0), масштабирование выполняется напрямую при чтении байтов,
-     * без создания гигантского 1920x2160 промежуточного Bitmap!
-     */
-    private fun jcodecPictureToBitmap(
-        src: Picture,
-        targetShortSide: Int,
-        buffers: JCodecReusableBuffers
-    ): Bitmap? {
+    private fun convertPictureToRgb(src: Picture, existingRgb: Picture?): Picture? {
         return try {
-            val rgbPic: Picture
             if (src.color == ColorSpace.RGB) {
-                rgbPic = src
+                src
             } else {
                 val transform = ColorUtil.getTransform(src.color, ColorSpace.RGB)
-                val existing: Picture? = buffers.rgbPic
-                val targetPic: Picture = if (existing != null && existing.width == src.width && existing.height == src.height) {
-                    existing
+                val targetPic: Picture = if (existingRgb != null && existingRgb.width == src.width && existingRgb.height == src.height) {
+                    existingRgb
                 } else {
-                    val created: Picture = Picture.create(src.width, src.height, ColorSpace.RGB)
-                    buffers.rgbPic = created
-                    created
+                    Picture.create(src.width, src.height, ColorSpace.RGB)
                 }
                 transform.transform(src, targetPic)
-                rgbPic = targetPic
+                targetPic
             }
+        } catch (e: Throwable) {
+            null
+        }
+    }
 
+    private fun quantizePictureDirect(
+        src: Picture,
+        rgbPic: Picture,
+        targetShortSide: Int,
+        encoder: AnimatedGifEncoder,
+        framePool: ArrayDeque<ByteArray>
+    ): ByteArray? {
+        return try {
             val w = rgbPic.width
             val h = rgbPic.height
             var cropX = 0
@@ -673,48 +778,22 @@ object GifConverter {
 
             val outW = if (scale < 1.0f) (((cropW * scale).toInt() + 1) / 2 * 2).coerceAtLeast(2) else cropW
             val outH = if (scale < 1.0f) (((cropH * scale).toInt() + 1) / 2 * 2).coerceAtLeast(2) else cropH
+            val numPixels = outW * outH
+            val rgbBytes = rgbPic.data[0]
 
-            val neededPixels = outW * outH
-            if (buffers.pixels.size < neededPixels) {
-                buffers.pixels = IntArray(neededPixels)
+            if (!encoder.isPaletteBuilt()) {
+                encoder.initFromJCodecRgb(rgbBytes, w, h, cropX, cropY, cropW, cropH, outW, outH)
             }
-            val pixels = buffers.pixels
-            val bytes = rgbPic.data[0]
-            val limit = bytes.size
 
-            if (outW == w && outH == h && cropX == 0 && cropY == 0) {
-                var bi = 0
-                for (i in 0 until neededPixels) {
-                    if (bi + 2 < limit) {
-                        val r = (bytes[bi++].toInt() + 128).coerceIn(0, 255)
-                        val g = (bytes[bi++].toInt() + 128).coerceIn(0, 255)
-                        val b = (bytes[bi++].toInt() + 128).coerceIn(0, 255)
-                        pixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-                    } else {
-                        pixels[i] = -0x1000000
-                    }
-                }
+            val pooled = framePool.pollFirst()
+            val destIndices = if (pooled != null && pooled.size == numPixels) {
+                pooled
             } else {
-                var outIdx = 0
-                for (oy in 0 until outH) {
-                    val sy = cropY + (oy * cropH) / outH
-                    val rowStart = sy * w
-                    for (ox in 0 until outW) {
-                        val sx = cropX + (ox * cropW) / outW
-                        val bi = (rowStart + sx) * 3
-                        if (bi + 2 < limit) {
-                            val r = (bytes[bi].toInt() + 128).coerceIn(0, 255)
-                            val g = (bytes[bi + 1].toInt() + 128).coerceIn(0, 255)
-                            val b = (bytes[bi + 2].toInt() + 128).coerceIn(0, 255)
-                            pixels[outIdx++] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-                        } else {
-                            pixels[outIdx++] = -0x1000000
-                        }
-                    }
-                }
+                ByteArray(numPixels)
             }
 
-            Bitmap.createBitmap(pixels, 0, outW, outW, outH, Bitmap.Config.ARGB_8888)
+            encoder.quantizeJCodecRgbToIndices(rgbBytes, w, h, cropX, cropY, cropW, cropH, outW, outH, destIndices)
+            destIndices
         } catch (e: Throwable) {
             e.printStackTrace()
             null
@@ -723,6 +802,7 @@ object GifConverter {
 
     /**
      * Извлечение кадров через MediaMetadataRetriever (резервный метод).
+     * Полностью защищён от повторного вызова recycle() на кэшированном кадре lastValid!
      */
     private fun extractWithRetriever(
         context: Context,
@@ -799,50 +879,54 @@ object GifConverter {
             }
 
             val actualDurationMs = min(durationMs, maxDurationSec * 1000L).coerceAtLeast(300L)
-            val frameIntervalMs = (1000L / fps).coerceAtLeast(40L)
-            val totalFrames = (actualDurationMs / frameIntervalMs).toInt().coerceIn(2, 150)
+            val frameIntervalMs = (1000L / fps).coerceAtLeast(33L)
+            val totalFrames = (actualDurationMs / frameIntervalMs).toInt().coerceIn(2, 180)
 
-            var lastValid: Bitmap? = null
+            var lastValidScaled: Bitmap? = null
 
             for (i in 0 until totalFrames) {
                 val timeUs = (i * actualDurationMs * 1000L) / totalFrames
-                var frame: Bitmap? = null
+                var rawFrame: Bitmap? = null
 
                 try {
-                    frame = mmr.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                    rawFrame = mmr.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
                 } catch (ignored: Throwable) {}
 
-                if (frame == null) {
+                if (rawFrame == null) {
                     try {
-                        frame = mmr.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                        rawFrame = mmr.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     } catch (ignored: Throwable) {}
                 }
 
-                val toUse = frame ?: lastValid
-                if (toUse != null) {
-                    val scaled = scaleBitmapIfNeeded(toUse, maxDimension)
+                if (rawFrame != null) {
+                    val scaled = scaleBitmapSafe(rawFrame, maxDimension)
+                    if (scaled !== rawFrame) {
+                        rawFrame.recycle()
+                    }
+                    if (lastValidScaled != null && lastValidScaled !== scaled && !lastValidScaled.isRecycled) {
+                        lastValidScaled.recycle()
+                    }
+                    lastValidScaled = scaled
+                }
 
+                val toEncode = lastValidScaled
+                if (toEncode != null && !toEncode.isRecycled) {
                     val startCs = Math.round((i * actualDurationMs) / (10.0 * totalFrames)).toInt()
                     val endCs = Math.round(((i + 1) * actualDurationMs) / (10.0 * totalFrames)).toInt()
                     val delayCs = (endCs - startCs).coerceIn(2, 100)
                     encoder.setDelay(delayCs * 10)
 
-                    encoder.addFrame(scaled)
-                    if (scaled != toUse) scaled.recycle()
-                    added++
-
-                    if (frame != null) {
-                        if (lastValid != null && lastValid != frame) {
-                            lastValid.recycle()
-                        }
-                        lastValid = frame
+                    if (encoder.addFrame(toEncode)) {
+                        added++
                     }
                 }
 
                 val p = 35 + ((i + 1) * 60 / totalFrames)
                 onProgress(p)
             }
-            lastValid?.recycle()
+            if (lastValidScaled != null && !lastValidScaled.isRecycled) {
+                lastValidScaled.recycle()
+            }
         } finally {
             try { retriever?.release() } catch (ignored: Throwable) {}
             try { pfd?.close() } catch (ignored: Throwable) {}
@@ -853,7 +937,7 @@ object GifConverter {
     }
 
     /**
-     * Извлечение кадров через Glide (резервный метод).
+     * Извлечение кадров через Glide (резервный метод) с отключённым HARDWARE Bitmap.
      */
     private fun extractWithGlide(
         context: Context,
@@ -872,18 +956,19 @@ object GifConverter {
                 ?: expectedDurationMs.takeIf { it > 0L }
                 ?: 3000L
             val actualDurationMs = min(durationMs, maxDurationSec * 1000L).coerceAtLeast(300L)
-            val frameIntervalMs = (1000L / fps).coerceAtLeast(40L)
-            val totalFrames = (actualDurationMs / frameIntervalMs).toInt().coerceIn(2, 120)
+            val frameIntervalMs = (1000L / fps).coerceAtLeast(33L)
+            val totalFrames = (actualDurationMs / frameIntervalMs).toInt().coerceIn(2, 150)
             var lastValid: Bitmap? = null
 
             for (i in 0 until totalFrames) {
                 val timeUs = (i * actualDurationMs * 1000L) / totalFrames
                 var frame: Bitmap? = null
                 try {
+                    val opts = RequestOptions.frameOf(timeUs).disallowHardwareConfig()
                     val req = Glide.with(context.applicationContext)
                         .asBitmap()
                         .load(videoFile)
-                        .apply(RequestOptions.frameOf(timeUs))
+                        .apply(opts)
                     frame = if (maxDimension > 0) {
                         req.submit(maxDimension, maxDimension).get()
                     } else {
@@ -891,28 +976,26 @@ object GifConverter {
                     }
                 } catch (ignored: Throwable) {}
 
-                val toUse = frame ?: lastValid
-                if (toUse != null) {
+                if (frame != null) {
+                    val scaled = scaleBitmapSafe(frame, maxDimension)
+                    lastValid = scaled
+                }
+
+                val toUse = lastValid
+                if (toUse != null && !toUse.isRecycled) {
                     val startCs = Math.round((i * actualDurationMs) / (10.0 * totalFrames)).toInt()
                     val endCs = Math.round(((i + 1) * actualDurationMs) / (10.0 * totalFrames)).toInt()
                     val delayCs = (endCs - startCs).coerceIn(2, 100)
                     encoder.setDelay(delayCs * 10)
 
-                    encoder.addFrame(toUse)
-                    added++
-
-                    if (frame != null) {
-                        if (lastValid != null && lastValid != frame) {
-                            lastValid.recycle()
-                        }
-                        lastValid = frame
+                    if (encoder.addFrame(toUse)) {
+                        added++
                     }
                 }
 
                 val p = 35 + ((i + 1) * 60 / totalFrames)
                 onProgress(p)
             }
-            lastValid?.recycle()
         } catch (e: Throwable) {
             e.printStackTrace()
         }

@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.xdownloader"
         minSdk = 24
         targetSdk = 34
-        versionCode = (project.findProperty("versionCode") as? String)?.toIntOrNull() ?: 27
-        versionName = "1.0.${(project.findProperty("versionCode") as? String) ?: "27"}"
+        versionCode = (project.findProperty("versionCode") as? String)?.toIntOrNull() ?: 28
+        versionName = "1.0.${(project.findProperty("versionCode") as? String) ?: "28"}"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
