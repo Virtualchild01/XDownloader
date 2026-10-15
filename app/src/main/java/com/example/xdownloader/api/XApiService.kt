@@ -19,9 +19,6 @@ class XApiService {
 
     private val gson = Gson()
 
-    /**
-     * Extracts Tweet numeric status ID from varied X / Twitter link forms.
-     */
     fun extractTweetId(url: String): String? {
         val pattern = Pattern.compile(
             "(?:https?://)?(?:www\\.|mobile\\.)?(?:twitter\\.com|x\\.com|vxtwitter\\.com|fxtwitter\\.com)/.*?/status/(\\d+)",
@@ -37,24 +34,18 @@ class XApiService {
         }
     }
 
-    /**
-     * Fetches post information and available media streams (MP4s, photos, GIF conversion options).
-     */
     suspend fun getPostInfo(tweetId: String): Result<XPostInfo> = withContext(Dispatchers.IO) {
         try {
-            // Attempt 1: VxTwitter public API (fast and returns structured media variants + duration_millis)
             val vxtResult = fetchFromVxTwitter(tweetId)
             if (vxtResult != null && vxtResult.mediaItems.isNotEmpty()) {
                 return@withContext Result.success(vxtResult)
             }
 
-            // Attempt 2: Official Twitter Syndication CDN API
             val syndicationResult = fetchFromSyndication(tweetId)
             if (syndicationResult != null && syndicationResult.mediaItems.isNotEmpty()) {
                 return@withContext Result.success(syndicationResult)
             }
 
-            // Attempt 3: FxTwitter secondary endpoint
             val fxtResult = fetchFromFxTwitter(tweetId)
             if (fxtResult != null && fxtResult.mediaItems.isNotEmpty()) {
                 return@withContext Result.success(fxtResult)
@@ -136,6 +127,7 @@ class XApiService {
                     "video", "gif" -> {
                         val isNativeGif = mTypeStr == "gif"
                         var bestMp4Url = mObj.get("url")?.asString ?: ""
+                        var mediumMp4Url = bestMp4Url
 
                         if (mObj.has("variants") && mObj.get("variants").isJsonArray) {
                             val varArray = mObj.getAsJsonArray("variants")
@@ -156,8 +148,9 @@ class XApiService {
                             mp4Variants.sortByDescending { it.first }
 
                             if (mp4Variants.isNotEmpty()) {
-                                // Всегда берём поток с максимальным битрейтом (оригинальное разрешение 1:1)
                                 bestMp4Url = mp4Variants.first().second
+                                mediumMp4Url = mp4Variants.firstOrNull { it.first in 400_000L..1_500_000L }?.second
+                                    ?: bestMp4Url
                             }
 
                             if (!isNativeGif) {
@@ -206,7 +199,8 @@ class XApiService {
                                     extension = "gif",
                                     downloadUrl = bestMp4Url,
                                     isGifConversion = true,
-                                    durationMs = durationMs
+                                    durationMs = durationMs,
+                                    targetGifMaxDim = 0
                                 )
                             )
                             formats.add(
@@ -222,12 +216,24 @@ class XApiService {
                         } else if (bestMp4Url.isNotEmpty()) {
                             formats.add(
                                 XFormatOption(
-                                    id = "gif_format",
-                                    label = "GIF (Конвертировать в .gif — оригинал)",
+                                    id = "gif_format_orig",
+                                    label = "GIF (Оригинальное разрешение HD — .gif)",
                                     extension = "gif",
                                     downloadUrl = bestMp4Url,
                                     isGifConversion = true,
-                                    durationMs = durationMs
+                                    durationMs = durationMs,
+                                    targetGifMaxDim = 0
+                                )
+                            )
+                            formats.add(
+                                XFormatOption(
+                                    id = "gif_format_fast",
+                                    label = "GIF (Компактный 720p — быстрый и лёгкий .gif)",
+                                    extension = "gif",
+                                    downloadUrl = mediumMp4Url,
+                                    isGifConversion = true,
+                                    durationMs = durationMs,
+                                    targetGifMaxDim = 720
                                 )
                             )
                         }
@@ -308,6 +314,7 @@ class XApiService {
                         if (mType == "video" || mType == "animated_gif") {
                             val isGif = mType == "animated_gif"
                             var bestUrl = ""
+                            var mediumUrl = ""
                             var durationMs = 0L
 
                             if (mObj.has("video_info") && mObj.get("video_info").isJsonObject) {
@@ -333,6 +340,8 @@ class XApiService {
 
                                     if (list.isNotEmpty()) {
                                         bestUrl = list.first().second
+                                        mediumUrl = list.firstOrNull { it.first in 400_000L..1_500_000L }?.second
+                                            ?: bestUrl
                                     }
 
                                     if (!isGif) {
@@ -369,7 +378,8 @@ class XApiService {
                                             extension = "gif",
                                             downloadUrl = bestUrl,
                                             isGifConversion = true,
-                                            durationMs = durationMs
+                                            durationMs = durationMs,
+                                            targetGifMaxDim = 0
                                         )
                                     )
                                     formats.add(
@@ -385,12 +395,24 @@ class XApiService {
                                 } else {
                                     formats.add(
                                         XFormatOption(
-                                            id = "gif_format",
-                                            label = "GIF (Конвертировать в .gif — оригинал)",
+                                            id = "gif_format_orig",
+                                            label = "GIF (Оригинальное разрешение HD — .gif)",
                                             extension = "gif",
                                             downloadUrl = bestUrl,
                                             isGifConversion = true,
-                                            durationMs = durationMs
+                                            durationMs = durationMs,
+                                            targetGifMaxDim = 0
+                                        )
+                                    )
+                                    formats.add(
+                                        XFormatOption(
+                                            id = "gif_format_fast",
+                                            label = "GIF (Компактный 720p — быстрый и лёгкий .gif)",
+                                            extension = "gif",
+                                            downloadUrl = mediumUrl.ifEmpty { bestUrl },
+                                            isGifConversion = true,
+                                            durationMs = durationMs,
+                                            targetGifMaxDim = 720
                                         )
                                     )
                                 }

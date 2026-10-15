@@ -14,7 +14,8 @@ data class XFormatOption(
     val bitrate: Long = 0,
     val isGifConversion: Boolean = false,
     val fileSizeFormatted: String = "",
-    val durationMs: Long = 0L
+    val durationMs: Long = 0L,
+    val targetGifMaxDim: Int = 0
 )
 
 data class XMediaItem(

@@ -124,7 +124,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupListeners() {
-        // Paste button
         binding.btnPaste.setOnClickListener {
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             val clip = clipboard.primaryClip
@@ -139,7 +138,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Find media button
         binding.btnFind.setOnClickListener {
             val url = binding.etUrl.text?.toString()?.trim() ?: ""
             if (url.isEmpty()) {
@@ -149,12 +147,10 @@ class MainActivity : AppCompatActivity() {
             fetchPostMedia(url)
         }
 
-        // Download button
         binding.btnDownload.setOnClickListener {
             checkPermissionsAndDownload()
         }
 
-        // Action: Open Downloads / Gallery
         binding.btnViewVideo.setOnClickListener {
             val uri = lastSavedFileUri
             if (uri != null) {
@@ -170,7 +166,6 @@ class MainActivity : AppCompatActivity() {
             openDownloadsFolder()
         }
 
-        // Action: Share link or downloaded file
         binding.btnShare.setOnClickListener {
             val uri = lastSavedFileUri
             if (uri != null) {
@@ -195,7 +190,6 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent.createChooser(shareIntent, "Поделиться ссылкой"))
         }
 
-        // Support Developer buttons
         binding.btnSupport.setOnClickListener {
             showSupportDialog()
         }
@@ -254,7 +248,6 @@ class MainActivity : AppCompatActivity() {
         selectedMediaItem = firstMedia
         lastSavedFileUri = null
 
-        // Badge styling
         when (firstMedia.type) {
             XMediaType.GIF -> {
                 binding.tvBadgeType.text = getString(R.string.badge_gif)
@@ -270,16 +263,13 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Load preview
         Glide.with(this)
             .load(firstMedia.previewUrl)
             .placeholder(android.R.drawable.ic_menu_gallery)
             .into(binding.ivPreview)
 
-        // Setup format options
         populateFormats(firstMedia.availableFormats)
 
-        // Reset status below action buttons
         binding.layoutStatus.visibility = View.GONE
         binding.progressDownload.visibility = View.GONE
         binding.tvStatus.text = ""
@@ -366,6 +356,7 @@ class MainActivity : AppCompatActivity() {
                     videoUrl = format.downloadUrl,
                     title = title,
                     expectedDurationMs = expectedDurationMs,
+                    maxDimension = format.targetGifMaxDim,
                     onStatusUpdate = { status ->
                         binding.tvStatus.text = status
                     },
@@ -412,10 +403,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Отслеживает статус системного DownloadManager в реальном времени,
-     * обновляет прогресс-бар и меняет статус на «Готово!» сразу после завершения скачивания.
-     */
     private fun trackDownloadProgress(downloadId: Long, mimeType: String) {
         val downloadManager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
 
@@ -472,7 +459,6 @@ class MainActivity : AppCompatActivity() {
                             }
                         }
                     } else {
-                        // Загрузка была отменена пользователем или удалена из очереди
                         isFinished = true
                         withContext(Dispatchers.Main) {
                             binding.progressDownload.visibility = View.GONE

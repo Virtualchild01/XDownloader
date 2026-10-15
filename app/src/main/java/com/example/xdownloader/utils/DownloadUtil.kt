@@ -27,9 +27,6 @@ object DownloadUtil {
         .followSslRedirects(true)
         .build()
 
-    /**
-     * Enqueues standard file download via Android DownloadManager.
-     */
     fun enqueueDownload(
         context: Context,
         url: String,
@@ -59,15 +56,12 @@ object DownloadUtil {
         return downloadManager.enqueue(request)
     }
 
-    /**
-     * Downloads video stream and converts it into a pure animated GIF file at 100% original resolution.
-     * @return Pair of (Uri?, errorMessage?)
-     */
     suspend fun downloadAndConvertToGif(
         context: Context,
         videoUrl: String,
         title: String,
         expectedDurationMs: Long = 0L,
+        maxDimension: Int = 0,
         onStatusUpdate: (String) -> Unit,
         onProgress: (Int) -> Unit
     ): Pair<Uri?, String?> = withContext(Dispatchers.IO) {
@@ -155,15 +149,14 @@ object DownloadUtil {
                 onProgress(35)
             }
 
-            // maxDimension = 0 означает сохранение 100% оригинального разрешения видео 1:1 без сжатия!
             val (gifUri, gifErr) = GifConverter.convertVideoToGif(
                 context = context,
                 videoFile = tempVideoFile,
                 targetTitle = "X_${sanitizeFilename(title)}",
                 expectedDurationMs = expectedDurationMs,
                 maxDurationSec = 12,
-                fps = 15,
-                maxDimension = 0
+                fps = 24,
+                maxDimension = maxDimension
             ) { gifPercent ->
                 onProgress(gifPercent)
             }
