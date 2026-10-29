@@ -28,6 +28,12 @@ class AnimatedGifEncoder {
     private var paletteBuilt: Boolean = false
     private var sample: Int = 5
 
+    /** Сколько кадров уже отдали свои цвета в общую палитру. */
+    private var paletteSamples: Int = 0
+
+    /** Накопленные частоты RGB555 по нескольким кадрам — из них строится палитра. */
+    private val paletteCounts: IntArray = IntArray(32768)
+
     private val transIndex: Int = 255
     private var colorTab: ByteArray = ByteArray(256 * 3)
     private val palR = IntArray(255)
@@ -40,6 +46,14 @@ class AnimatedGifEncoder {
     private var prevPalPixels: ByteArray = ByteArray(0)
 
     companion object {
+        /**
+         * Сколько кадров усредняем в общую палитру. Палитра, построенная по одному
+         * первому кадру, делала GIF тёмным, если ролик начинается с чёрного кадра
+         * или с плавного появления из темноты: в палитру попадали только тёмные
+         * оттенки, и дальше весь ролик квантовался в них.
+         */
+        private const val MAX_PALETTE_SAMPLES = 12
+
         // Матрица упорядоченного дизеринга Байера 4x4 (значения -4..+3)
         private val BAYER_4X4 = intArrayOf(
             -4,  0, -3,  1,
@@ -96,11 +110,20 @@ class AnimatedGifEncoder {
 
     fun isPaletteBuilt(): Boolean = paletteBuilt
 
+    /**
+     * Слот 255 занят прозрачностью, поэтому реальных цветов 255.
+     * Собранная по одному кадру палитра делала весь GIF тёмным, если ролик
+     * начинается с чёрного кадра или плавного появления из темноты.
+     */
+    fun canAddPaletteSample(): Boolean = paletteSamples < MAX_PALETTE_SAMPLES
+
     fun start(os: OutputStream): Boolean {
         out = os
         started = true
         firstFrame = true
         paletteBuilt = false
+        paletteSamples = 0
+        Arrays.fill(paletteCounts, 0)
         return try {
             writeString("GIF89a")
             true
@@ -113,8 +136,15 @@ class AnimatedGifEncoder {
      * Инициализирует глобальную палитру напрямую из RGB-байтов JCodec (без создания Bitmap!)
      * и записывает заголовок GIF (LSD + Palette + NetscapeExt).
      */
-    @Throws(IOException::class)
-    fun initFromJCodecRgb(
+    /**
+     * Добавляет цвета одного кадра в общую гистограмму палитры.
+     *
+     * Заголовок GIF здесь НЕ пишется: палитра собирается по нескольким кадрам,
+     * и только [finalizePalette] фиксирует её и открывает поток. Раньше палитра
+     * строилась по первому кадру, из-за чего ролик с чёрным первым кадром или
+     * плавным появлением из темноты превращался в почти чёрный GIF.
+     */
+    fun accumulateJCodecRgb(
         rgbBytes: ByteArray,
         srcW: Int,
         srcH: Int,
@@ -136,7 +166,7 @@ class AnimatedGifEncoder {
             prevPalPixels = ByteArray(numPixels)
         }
 
-        val counts = IntArray(32768)
+        val counts = paletteCounts
         val limit = rgbBytes.size
 
         if (outW == srcW && outH == srcH && cropX == 0 && cropY == 0) {
@@ -167,14 +197,41 @@ class AnimatedGifEncoder {
                 }
             }
         }
+        paletteSamples++
+    }
 
-        finalizePaletteFromCounts(counts)
+    /**
+     * Фиксирует накопленную палитру и пишет заголовок GIF (LSD + GCT + Netscape).
+     * После этого поток готов принимать кадры через [writeQuantizedFrame].
+     */
+    @Throws(IOException::class)
+    fun finalizePalette() {
+        if (paletteBuilt) return
+        finalizePaletteFromCounts(paletteCounts)
         writeLSD()
         writePalette()
         if (repeat >= 0) {
             writeNetscapeExt()
         }
         paletteBuilt = true
+    }
+
+    /** Совместимость: один кадр и сразу фиксация палитры. */
+    @Throws(IOException::class)
+    fun initFromJCodecRgb(
+        rgbBytes: ByteArray,
+        srcW: Int,
+        srcH: Int,
+        cropX: Int,
+        cropY: Int,
+        cropW: Int,
+        cropH: Int,
+        outW: Int,
+        outH: Int
+    ) {
+        if (paletteBuilt) return
+        accumulateJCodecRgb(rgbBytes, srcW, srcH, cropX, cropY, cropW, cropH, outW, outH)
+        finalizePalette()
     }
 
     /**
@@ -303,13 +360,8 @@ class AnimatedGifEncoder {
                 if (prevPalPixels.size != numPixels) {
                     prevPalPixels = ByteArray(numPixels)
                 }
-                buildPaletteFromBitmap(safeBmp)
-                writeLSD()
-                writePalette()
-                if (repeat >= 0) {
-                    writeNetscapeExt()
-                }
-                paletteBuilt = true
+                accumulateBitmapInto(safeBmp)
+                finalizePalette()
             }
 
             var frameBmp = safeBmp
@@ -385,11 +437,14 @@ class AnimatedGifEncoder {
         prevPalPixels = ByteArray(0)
         firstFrame = true
         paletteBuilt = false
+        paletteSamples = 0
+        Arrays.fill(paletteCounts, 0)
         return ok
     }
 
-    private fun buildPaletteFromBitmap(bmp: Bitmap) {
-        val counts = IntArray(32768)
+    /** Добавляет цвета Bitmap-кадра в общую гистограмму палитры (без её фиксации). */
+    private fun accumulateBitmapInto(bmp: Bitmap) {
+        val counts = paletteCounts
         val w = width
         val h = height
         val row = rowBuffer
@@ -402,7 +457,7 @@ class AnimatedGifEncoder {
                 counts[bIdx]++
             }
         }
-        finalizePaletteFromCounts(counts)
+        paletteSamples++
     }
 
     private fun finalizePaletteFromCounts(counts: IntArray) {
@@ -413,10 +468,20 @@ class AnimatedGifEncoder {
         }
         Arrays.sort(packed)
 
-        // Слоты 0..215: 216 самых частых оттенков сцены из первого кадра
-        for (slot in 0 until 216) {
-            val pk = packed[32767 - slot]
+        // Слоты 0..215: самые частые оттенки сцены, собранные по нескольким кадрам.
+        //
+        // Берём только непустые корзины. Раньше цикл шёл ровно 216 раз и после
+        // исчерпания реальных цветов добирал пустые корзины по убыванию индекса —
+        // а высокий индекс RGB555 это яркие цвета. В палитру попадали случайные
+        // яркие оттенки, которых в ролике нет, и вся картинка квантовалась в них.
+        var topColor = 0
+        var slot = 0
+        var i = 32767
+        while (slot < 216 && i >= 0) {
+            val pk = packed[i]
             val bIdx = (pk and 32767L).toInt()
+            if (counts[bIdx] <= 0) break // дальше только пустые корзины
+            if (slot == 0) topColor = bIdx
             val r = ((bIdx shr 10) and 31) * 8 + 4
             val g = ((bIdx shr 5) and 31) * 8 + 4
             val b = (bIdx and 31) * 8 + 4
@@ -427,6 +492,23 @@ class AnimatedGifEncoder {
             colorTab[slot * 3 + 1] = g.toByte()
             colorTab[slot * 3 + 2] = b.toByte()
             rgb555Lut[bIdx] = slot
+            slot++
+            i--
+        }
+
+        // Оставшиеся слоты дублируют самый частый цвет: дубли безвредны для поиска
+        // ближайшего, зато палитра остаётся из реальных цветов ролика.
+        val fillR = ((topColor shr 10) and 31) * 8 + 4
+        val fillG = ((topColor shr 5) and 31) * 8 + 4
+        val fillB = (topColor and 31) * 8 + 4
+        while (slot < 216) {
+            palR[slot] = fillR
+            palG[slot] = fillG
+            palB[slot] = fillB
+            colorTab[slot * 3] = fillR.toByte()
+            colorTab[slot * 3 + 1] = fillG.toByte()
+            colorTab[slot * 3 + 2] = fillB.toByte()
+            slot++
         }
 
         // Слоты 216..254: 39 насыщенных хроматических акцентов

@@ -34,6 +34,7 @@ import com.example.xdownloader.api.XMediaItem
 import com.example.xdownloader.api.XMediaType
 import com.example.xdownloader.api.XPostInfo
 import com.example.xdownloader.databinding.ActivityMainBinding
+import com.example.xdownloader.ui.GalleryActivity
 import com.example.xdownloader.utils.DownloadUtil
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlinx.coroutines.Dispatchers
@@ -166,21 +167,8 @@ class MainActivity : AppCompatActivity() {
             checkPermissionsAndDownload()
         }
 
-        // Action: Open Downloads / Gallery
-        binding.btnViewVideo.setOnClickListener {
-            val uri = lastSavedFileUri
-            if (uri != null) {
-                try {
-                    val intent = Intent(Intent.ACTION_VIEW).apply {
-                        setDataAndType(uri, lastSavedMimeType)
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    }
-                    startActivity(intent)
-                    return@setOnClickListener
-                } catch (ignored: Exception) {}
-            }
-            openDownloadsFolder()
-        }
+        // Action: открыть встроенную галерею «Мои загрузки»
+        binding.btnViewVideo.setOnClickListener { openGallery() }
 
         // Action: Share link or downloaded file
         binding.btnShare.setOnClickListener {
@@ -214,6 +202,13 @@ class MainActivity : AppCompatActivity() {
         binding.btnSupportHeader.setOnClickListener {
             showSupportDialog()
         }
+
+        // «Мои загрузки» в шапке
+        binding.btnGallery.setOnClickListener { openGallery() }
+    }
+
+    private fun openGallery() {
+        startActivity(Intent(this, GalleryActivity::class.java))
     }
 
     private fun handleIncomingIntent(intent: Intent) {
@@ -446,7 +441,7 @@ class MainActivity : AppCompatActivity() {
                 if (uri != null) {
                     lastSavedFileUri = uri
                     lastSavedMimeType = "image/gif"
-                    binding.tvStatus.text = "Готово! Файл GIF сохранён в «Загрузки»"
+                    binding.tvStatus.text = getString(R.string.toast_saved_to)
                     Toast.makeText(this@MainActivity, getString(R.string.toast_gif_saved), Toast.LENGTH_LONG).show()
                 } else {
                     val err = errorMsg ?: "Не удалось создать GIF"
@@ -513,8 +508,8 @@ class MainActivity : AppCompatActivity() {
                                     lastSavedFileUri = savedUri
                                     lastSavedMimeType = mimeType
                                     binding.progressDownload.visibility = View.GONE
-                                    binding.tvStatus.text = "Готово! Файл сохранён в «Загрузки»"
-                                    Toast.makeText(this@MainActivity, "Файл сохранён в «Загрузки»!", Toast.LENGTH_SHORT).show()
+                                    binding.tvStatus.text = getString(R.string.toast_saved_to)
+                                    Toast.makeText(this@MainActivity, getString(R.string.toast_saved_to), Toast.LENGTH_SHORT).show()
                                 }
                             }
                             DownloadManager.STATUS_FAILED -> {
@@ -548,7 +543,7 @@ class MainActivity : AppCompatActivity() {
                     isFinished = true
                     withContext(Dispatchers.Main) {
                         binding.progressDownload.visibility = View.GONE
-                        binding.tvStatus.text = "Готово! Файл сохранён в «Загрузки»"
+                        binding.tvStatus.text = getString(R.string.toast_saved_to)
                     }
                 } finally {
                     try { cursor?.close() } catch (ignored: Exception) {}
@@ -561,21 +556,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun openDownloadsFolder() {
-        try {
-            val intent = Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)
-            startActivity(intent)
-        } catch (e: Exception) {
-            val fallbackIntent = Intent(Intent.ACTION_GET_CONTENT).apply {
-                type = "*/*"
-            }
-            try {
-                startActivity(Intent.createChooser(fallbackIntent, "Открыть папку Загрузки"))
-            } catch (ex: Exception) {
-                Toast.makeText(this, "Файлы сохранены в системную папку «Загрузки»", Toast.LENGTH_LONG).show()
-            }
-        }
-    }
 
     private fun showSupportDialog() {
         MaterialAlertDialogBuilder(this)

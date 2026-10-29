@@ -3,6 +3,13 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// versionCode только растёт: иначе Android откажется ставить обновление поверх.
+// CI передаёт -PversionCode=${{ github.run_number }}, а он у каждого workflow свой
+// и начинается с 1 — без этого пола CI выпускал APK, который не вставал поверх 1.0.26.
+val minVersionCode = 27
+val declaredVersionCode = (project.findProperty("versionCode") as? String)?.toIntOrNull() ?: 0
+val appVersionCode = maxOf(declaredVersionCode, minVersionCode)
+
 android {
     namespace = "com.example.xdownloader"
     compileSdk = 34
@@ -11,8 +18,8 @@ android {
         applicationId = "com.example.xdownloader"
         minSdk = 24
         targetSdk = 34
-        versionCode = (project.findProperty("versionCode") as? String)?.toIntOrNull() ?: 28
-        versionName = "1.0.${(project.findProperty("versionCode") as? String) ?: "28"}"
+        versionCode = appVersionCode
+        versionName = "1.0.$appVersionCode"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -57,6 +64,11 @@ android {
     buildFeatures {
         viewBinding = true
     }
+
+    // Заглушки android.jar в JVM-тестах возвращают значения по умолчанию вместо исключений
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -80,4 +92,11 @@ dependencies {
 
     // Pure Java H.264 / MP4 frame extractor (100% device & OEM independent)
     implementation("org.jcodec:jcodec:0.2.5")
+
+    // Встроенная галерея «Мои загрузки»
+    implementation("androidx.recyclerview:recyclerview:1.3.2")
+    implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.1.0")
+
+    // JVM-тесты для разбора MP4 и кодирования GIF: обе части не трогают Android API
+    testImplementation("junit:junit:4.13.2")
 }

@@ -1,0 +1,23 @@
+# Gradle
+.gradle/
+build/
+app/build/
+
+# Локальная конфигурация SDK
+local.properties
+
+# IDE
+.idea/
+*.iml
+captures/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Подпись: ключ намеренно лежит в репозитории (обновления должны ставиться поверх),
+# но пароли и личные копии ключа сюда попадать не должны
+*.jks
+!app/debug.keystore
+*.keystore
+!app/debug.keystore

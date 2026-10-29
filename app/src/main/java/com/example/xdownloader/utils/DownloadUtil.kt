@@ -1,13 +1,10 @@
 package com.example.xdownloader.utils
 
 import android.app.DownloadManager
-import android.content.ContentValues
 import android.content.Context
-import android.media.MediaScannerConnection
 import android.net.Uri
-import android.os.Build
 import android.os.Environment
-import android.provider.MediaStore
+import com.example.xdownloader.data.DownloadStorage
 import com.example.xdownloader.gif.GifConverter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -49,7 +46,11 @@ object DownloadUtil {
             setTitle("XDownloader: $title")
             setDescription("Скачивание $formatLabel...")
             setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+            // Единая папка приложения: Movies/XDownloader, как в YTDownloader
+            setDestinationInExternalPublicDir(
+                Environment.DIRECTORY_MOVIES,
+                "${DownloadStorage.SUBDIR}/$fileName"
+            )
             setAllowedOverMetered(true)
             setAllowedOverRoaming(true)
             addRequestHeader(
@@ -143,8 +144,10 @@ object DownloadUtil {
             val isGif = readCount >= 3 && headerBytes[0] == 'G'.code.toByte() && headerBytes[1] == 'I'.code.toByte() && headerBytes[2] == 'F'.code.toByte()
 
             if (isGif) {
+                // X уже отдаёт готовый GIF — конвертировать нечего, просто кладём файл
+                // в общую папку приложения Movies/XDownloader.
                 val safeTitle = sanitizeFilename(title)
-                val directGifUri = saveRawGifToDownloads(context, tempVideoFile, "${safeTitle}_anim.gif")
+                val directGifUri = DownloadStorage.save(context, tempVideoFile, "${safeTitle}_anim.gif")
                 withContext(Dispatchers.Main) {
                     onProgress(100)
                 }
@@ -176,51 +179,6 @@ object DownloadUtil {
             if (tempVideoFile.exists()) {
                 tempVideoFile.delete()
             }
-        }
-    }
-
-    private fun saveRawGifToDownloads(context: Context, gifFile: File, fileName: String): Uri? {
-        return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                    put(MediaStore.MediaColumns.MIME_TYPE, "image/gif")
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
-                    put(MediaStore.MediaColumns.SIZE, gifFile.length())
-                    put(MediaStore.MediaColumns.IS_PENDING, 1)
-                }
-                val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                if (uri != null) {
-                    context.contentResolver.openOutputStream(uri)?.use { out ->
-                        FileInputStream(gifFile).use { input ->
-                            input.copyTo(out, 262144)
-                        }
-                        out.flush()
-                    }
-                    val updateValues = ContentValues().apply {
-                        put(MediaStore.MediaColumns.IS_PENDING, 0)
-                        put(MediaStore.MediaColumns.SIZE, gifFile.length())
-                    }
-                    context.contentResolver.update(uri, updateValues, null, null)
-                }
-                uri
-            } else {
-                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                if (!downloadsDir.exists()) downloadsDir.mkdirs()
-                val targetFile = File(downloadsDir, fileName)
-                FileInputStream(gifFile).use { input ->
-                    FileOutputStream(targetFile).use { output ->
-                        input.copyTo(output, 262144)
-                        output.flush()
-                    }
-                }
-                try {
-                    MediaScannerConnection.scanFile(context, arrayOf(targetFile.absolutePath), arrayOf("image/gif"), null)
-                } catch (ignored: Throwable) {}
-                Uri.fromFile(targetFile)
-            }
-        } catch (ignored: Exception) {
-            null
         }
     }
 

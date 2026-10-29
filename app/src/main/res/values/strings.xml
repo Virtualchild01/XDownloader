@@ -13,9 +13,28 @@
     <string name="btn_close">Закрыть</string>
     <string name="toast_empty_url">Пожалуйста, вставьте ссылку на пост из сети X</string>
     <string name="toast_download_started">Загрузка запущена! Проверьте шторку уведомлений.</string>
-    <string name="toast_gif_saved">Анимированный GIF сохранён в папку «Загрузки»!</string>
+    <string name="toast_gif_saved">Анимированный GIF сохранён в Movies/XDownloader!</string>
     <string name="toast_error">Ошибка получения данных: %1$s</string>
     <string name="badge_gif">GIF</string>
     <string name="badge_video">ВИДЕО</string>
     <string name="badge_photo">ФОТО</string>
+
+    <!-- Галерея «Мои загрузки» -->
+    <string name="gallery_title">Мои загрузки</string>
+    <string name="gallery_empty">Здесь появятся скачанные видео, фото и GIF</string>
+    <string name="gallery_open">Мои загрузки</string>
+    <string name="back">Назад</string>
+    <string name="cancel">Отмена</string>
+    <string name="file_actions">Действия с файлом</string>
+    <string name="share_file">Поделиться</string>
+    <string name="share_failed">Не удалось поделиться файлом</string>
+    <string name="delete_title">Удалить файл?</string>
+    <string name="delete_action">Удалить</string>
+    <string name="delete_failed">Не удалось удалить файл</string>
+    <string name="no_player_for_format">Нет приложения, способного открыть этот формат</string>
+    <string name="size_unknown">—</string>
+    <string name="unit_kb">КБ</string>
+    <string name="unit_mb">МБ</string>
+    <string name="unit_gb">ГБ</string>
+    <string name="toast_saved_to">Готово! Файл сохранён в Movies/XDownloader</string>
 </resources>
