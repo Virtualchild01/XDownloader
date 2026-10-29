@@ -1,7 +1,5 @@
 package com.example.xdownloader.ui
 
-import android.content.Intent
-import android.net.Uri
 import android.os.Bundle
 import android.view.View
 import android.widget.Toast
@@ -11,6 +9,7 @@ import androidx.recyclerview.widget.GridLayoutManager
 import com.example.xdownloader.R
 import com.example.xdownloader.data.DownloadStorage
 import com.example.xdownloader.data.DownloadedMedia
+import com.example.xdownloader.data.MediaSharer
 import com.example.xdownloader.databinding.ActivityGalleryBinding
 import com.example.xdownloader.databinding.SheetFileActionsBinding
 import com.google.android.material.bottomsheet.BottomSheetDialog
@@ -19,7 +18,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/** Встроенная галерея: сетка файлов из Movies/XDownloader. */
+/** Встроенная галерея: сетка скачанных файлов из папок приложения. */
 class GalleryActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityGalleryBinding
@@ -60,13 +59,7 @@ class GalleryActivity : AppCompatActivity() {
 
     /** Видео открываем во внешнем плеере, GIF/JPG — в системном просмотрщике. */
     private fun open(media: DownloadedMedia) {
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(media.uri, media.mimeType)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        try {
-            startActivity(intent)
-        } catch (e: Exception) {
+        if (!MediaSharer.open(this, media)) {
             Toast.makeText(this, R.string.no_player_for_format, Toast.LENGTH_LONG).show()
         }
     }
@@ -92,14 +85,7 @@ class GalleryActivity : AppCompatActivity() {
     }
 
     private fun share(media: DownloadedMedia) {
-        try {
-            val intent = Intent(Intent.ACTION_SEND).apply {
-                type = media.mimeType
-                putExtra(Intent.EXTRA_STREAM, media.uri)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            startActivity(Intent.createChooser(intent, getString(R.string.share_file)))
-        } catch (e: Exception) {
+        if (!MediaSharer.share(this, media, getString(R.string.share_file))) {
             Toast.makeText(this, R.string.share_failed, Toast.LENGTH_SHORT).show()
         }
     }

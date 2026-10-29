@@ -13,53 +13,92 @@ import java.io.File
 import java.io.FileInputStream
 
 /**
- * Хранилище скачанного: всё лежит в одной публичной папке Movies/XDownloader.
+ * Хранилище скачанного.
  *
- * Почему через [MediaStore.Files], а не через коллекции Images/Video: у каждой
- * коллекции свой белый список верхних папок. Картинку (GIF) система разрешает
- * только в DCIM и Pictures, видео — в Movies, поэтому записать GIF в Movies
- * через MediaStore.Images нельзя (IllegalArgumentException). Коллекция Files
- * такого ограничения не имеет, файл при этом физически лежит в Movies/XDownloader
- * и виден и в галерее, и в Проводнике.
+ * Куда именно можно писать, задаёт не приложение, а платформа. В AOSP
+ * (MediaProvider.ensureFileColumns) у каждой коллекции MediaStore свой белый
+ * список верхних папок:
+ *  - Files   → только Downloads и Documents;
+ *  - Images  → только DCIM и Pictures;
+ *  - Video   → DCIM, Movies и Pictures.
+ * Поэтому картинку (GIF, JPG) физически нельзя положить в Movies на Android 10+:
+ * запрос отклоняется с "Primary directory Movies not allowed". Раньше здесь
+ * использовалась коллекция Files с путём Movies/... — она принимает только
+ * Downloads и Documents, из-за чего сохранение GIF падало всегда.
+ *
+ * Отсюда раскладка по типу файла:
+ *  - видео → Movies/XDownloader;
+ *  - фото и GIF → Pictures/XDownloader.
+ * Обе папки публичные: видны в системной галерее, в Проводнике и во встроенной
+ * галерее приложения. На Android 9 и ниже ограничений нет, и всё пишется
+ * напрямую в те же папки.
  */
 object DownloadStorage {
 
     const val SUBDIR = "XDownloader"
 
-    /** Публичная папка, в которую пишет приложение. */
-    val relativePath: String get() = "${Environment.DIRECTORY_MOVIES}/$SUBDIR"
+    // Константы Environment — это просто строки, но в JVM-тестах они заглушены и
+    // возвращают null, поэтому пути собираются из литералов.
+    private const val DIR_MOVIES = "Movies"
+    private const val DIR_PICTURES = "Pictures"
+    private const val DIR_DOWNLOADS = "Download"
+
+    /** Публичная папка для видео. */
+    val videoPath: String get() = "$DIR_MOVIES/$SUBDIR"
+
+    /** Публичная папка для изображений и GIF: в Movies платформа их не пускает. */
+    val imagePath: String get() = "$DIR_PICTURES/$SUBDIR"
+
+    /** Где версии до 1.0.28 складывали готовые GIF. */
+    private val legacyDownloadsPath: String get() = "$DIR_DOWNLOADS/$SUBDIR"
 
     private fun isScoped(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+
+    /**
+     * Папка под конкретный тип файла. Видео — Movies, всё остальное — Pictures.
+     *
+     * Отдельная функция (а не инлайн-ветка) ради теста: именно неверный выбор
+     * коллекции/папки был причиной ошибки «не удалось сохранить GIF».
+     */
+    internal fun relativePathFor(mime: String): String =
+        if (mime.startsWith("video/")) videoPath else imagePath
 
     // ---------------------------------------------------------------- запись
 
     /**
-     * Кладёт [source] в Movies/XDownloader под именем [displayName].
-     * @return Uri сохранённого файла или null при ошибке
+     * Кладёт [source] в публичную папку приложения: видео — в Movies/XDownloader,
+     * изображения и GIF — в Pictures/XDownloader.
+     *
+     * @return Uri сохранённого файла или null, если записать не удалось
      */
     fun save(context: Context, source: File, displayName: String): Uri? {
-        val safeName = uniqueName(context, sanitizeName(displayName))
-        val mime = mimeFromName(safeName)
-        if (isScoped()) {
-            // На части прошивок коллекция Files может отказать в записи в Movies —
-            // тогда пробуем прямую запись, чтобы файл всё-таки сохранился.
-            saveScoped(context, source, safeName, mime)?.let { return it }
+        val mime = mimeFromName(displayName)
+        val safeName = uniqueName(context, sanitizeName(displayName), mime)
+        return if (isScoped()) {
+            saveScoped(context, source, safeName, mime)
+        } else {
+            saveLegacy(context, source, safeName, mime)
         }
-        return saveLegacy(context, source, safeName, mime)
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun saveScoped(context: Context, source: File, displayName: String, mime: String): Uri? {
         val resolver = context.contentResolver
+        val collection = if (mime.startsWith("video/")) {
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        } else {
+            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        }
+
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
             put(MediaStore.MediaColumns.MIME_TYPE, mime)
-            put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+            put(MediaStore.MediaColumns.RELATIVE_PATH, relativePathFor(mime))
             put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
 
         val uri = try {
-            resolver.insert(MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values)
+            resolver.insert(collection, values)
         } catch (e: Exception) {
             null
         } ?: return null
@@ -84,7 +123,8 @@ object DownloadStorage {
     }
 
     private fun saveLegacy(context: Context, source: File, displayName: String, mime: String): Uri? {
-        val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES), SUBDIR)
+        val base = if (mime.startsWith("video/")) DIR_MOVIES else DIR_PICTURES
+        val dir = File(Environment.getExternalStoragePublicDirectory(base), SUBDIR)
         if (!dir.exists() && !dir.mkdirs()) return null
 
         val target = File(dir, displayName)
@@ -100,33 +140,39 @@ object DownloadStorage {
     }
 
     /** Не перезаписывает существующий файл: добавляет « (1)», « (2)» и т. д. */
-    private fun uniqueName(context: Context, displayName: String): String {
-        if (!exists(context, displayName)) return displayName
+    private fun uniqueName(context: Context, displayName: String, mime: String): String {
+        if (!exists(context, displayName, mime)) return displayName
         val base = displayName.substringBeforeLast('.', displayName)
         val ext = displayName.substringAfterLast('.', "").let { if (it.isEmpty()) "" else ".$it" }
         var counter = 1
         while (counter < 1000) {
             val candidate = "$base ($counter)$ext"
-            if (!exists(context, candidate)) return candidate
+            if (!exists(context, candidate, mime)) return candidate
             counter++
         }
         return displayName
     }
 
-    private fun exists(context: Context, displayName: String): Boolean {
+    private fun exists(context: Context, displayName: String, mime: String): Boolean {
         if (!isScoped()) {
-            val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES), SUBDIR)
+            val base = if (mime.startsWith("video/")) DIR_MOVIES else DIR_PICTURES
+            val dir = File(Environment.getExternalStoragePublicDirectory(base), SUBDIR)
             return File(dir, displayName).exists()
+        }
+        val collection = if (mime.startsWith("video/")) {
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        } else {
+            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         }
         val projection = arrayOf(MediaStore.MediaColumns._ID)
         val selection = "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ? AND " +
             "${MediaStore.MediaColumns.DISPLAY_NAME} = ?"
         return try {
             context.contentResolver.query(
-                MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+                collection,
                 projection,
                 selection,
-                arrayOf("$relativePath%", displayName),
+                arrayOf("${relativePathFor(mime)}%", displayName),
                 null
             )?.use { it.count > 0 } ?: false
         } catch (e: Exception) {
@@ -141,6 +187,44 @@ object DownloadStorage {
 
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun listScoped(context: Context): List<DownloadedMedia> {
+        // Основной источник — правильные коллекции: Video для видео, Images для
+        // картинок и GIF. Так у файлов гарантированно верный MIME.
+        val videos = queryScoped(
+            context,
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+            videoPath
+        )
+        val images = queryScoped(
+            context,
+            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+            imagePath
+        )
+
+        // Дополнительно смотрим коллекцию Files по обеим папкам приложения.
+        // DownloadManager регистрирует скачанное в своей коллекции, и файл,
+        // физически лежащий в Movies/XDownloader, мог не попасть в выборку Video.
+        // Files видит все файлы сразу, поэтому ничего не теряется.
+        val files = queryScoped(context, MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), videoPath) +
+            queryScoped(context, MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), imagePath)
+
+        // Файлы версий до 1.0.28 лежали в Download/XDownloader — показываем их,
+        // чтобы галерея не опустела после обновления.
+        val legacy = queryScoped(
+            context,
+            MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+            legacyDownloadsPath
+        )
+
+        // Один и тот же файл может прийти из двух коллекций: разные content:// Uri,
+        // но одно имя в одной папке. Ключ — имя, последняя запись побеждает.
+        return (videos + images + files + legacy)
+            .associateBy { it.displayName }
+            .values
+            .sortedByDescending { it.dateAddedSec }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun queryScoped(context: Context, collection: Uri, pathPrefix: String): List<DownloadedMedia> {
         val projection = arrayOf(
             MediaStore.MediaColumns._ID,
             MediaStore.MediaColumns.DISPLAY_NAME,
@@ -153,10 +237,10 @@ object DownloadStorage {
         val result = mutableListOf<DownloadedMedia>()
         try {
             context.contentResolver.query(
-                MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+                collection,
                 projection,
                 selection,
-                arrayOf("$relativePath%"),
+                arrayOf("$pathPrefix%"),
                 "${MediaStore.MediaColumns.DATE_ADDED} DESC"
             )?.use { cursor ->
                 val idCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
@@ -169,13 +253,9 @@ object DownloadStorage {
                     val name = if (nameCol >= 0) cursor.getString(nameCol) else null
                     if (name.isNullOrEmpty()) continue
                     val mime = if (mimeCol >= 0) cursor.getString(mimeCol) ?: "" else ""
-                    // Папка может содержать служебные файлы (.nomedia и подобные)
-                    if (mime.isEmpty() && !isMediaName(name)) continue
+                    if (!isMediaName(name)) continue
                     result += DownloadedMedia(
-                        uri = ContentUris.withAppendedId(
-                            MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
-                            cursor.getLong(idCol)
-                        ),
+                        uri = ContentUris.withAppendedId(collection, cursor.getLong(idCol)),
                         displayName = name,
                         sizeBytes = if (sizeCol >= 0) cursor.getLong(sizeCol) else 0L,
                         dateAddedSec = if (dateCol >= 0) cursor.getLong(dateCol) else 0L,
@@ -190,21 +270,29 @@ object DownloadStorage {
     }
 
     private fun listLegacy(): List<DownloadedMedia> {
-        val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES), SUBDIR)
-        if (!dir.isDirectory) return emptyList()
-        return dir.listFiles()
-            ?.filter { it.isFile && isMediaName(it.name) }
-            ?.map { file ->
-                DownloadedMedia(
-                    uri = Uri.fromFile(file),
-                    displayName = file.name,
-                    sizeBytes = file.length(),
-                    dateAddedSec = file.lastModified() / 1000L,
-                    mimeType = mimeFromName(file.name)
-                )
+        val dirs = listOf(
+            File(Environment.getExternalStoragePublicDirectory(DIR_MOVIES), SUBDIR),
+            File(Environment.getExternalStoragePublicDirectory(DIR_PICTURES), SUBDIR),
+            File(Environment.getExternalStoragePublicDirectory(DIR_DOWNLOADS), SUBDIR)
+        )
+
+        return dirs
+            .filter { it.isDirectory }
+            .flatMap { dir ->
+                dir.listFiles()
+                    ?.filter { it.isFile && isMediaName(it.name) }
+                    ?.map { file ->
+                        DownloadedMedia(
+                            uri = Uri.fromFile(file),
+                            displayName = file.name,
+                            sizeBytes = file.length(),
+                            dateAddedSec = file.lastModified() / 1000L,
+                            mimeType = mimeFromName(file.name)
+                        )
+                    }
+                    ?: emptyList()
             }
-            ?.sortedByDescending { it.dateAddedSec }
-            ?: emptyList()
+            .sortedByDescending { it.dateAddedSec }
     }
 
     // ------------------------------------------------------------- удаление

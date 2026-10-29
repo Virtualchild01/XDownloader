@@ -244,10 +244,11 @@ object GifConverter {
                 return@withContext Pair(null, msg)
             }
 
-            // Кладём проверенный целостный GIF в общую папку приложения Movies/XDownloader
+            // GIF — это изображение, поэтому он кладётся в Pictures/XDownloader:
+            // платформа не разрешает писать картинки в Movies (см. DownloadStorage).
             val savedUri = DownloadStorage.save(context, tempGifFile, fileName)
             if (savedUri == null) {
-                return@withContext Pair(null, "Не удалось сохранить готовый GIF в Movies/XDownloader")
+                return@withContext Pair(null, "Не удалось сохранить готовый GIF в Pictures/XDownloader")
             }
 
             withContext(Dispatchers.Main) {

@@ -48,6 +48,17 @@
             android:name=".ui.GalleryActivity"
             android:exported="false"
             android:label="@string/gallery_title" />
+
+        <!-- Android 7-9 хранят файлы как file://, наружу такой путь отдавать нельзя -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>

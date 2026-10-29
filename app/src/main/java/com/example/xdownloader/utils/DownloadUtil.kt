@@ -17,6 +17,10 @@ import java.util.concurrent.TimeUnit
 
 object DownloadUtil {
 
+    /** X отдаёт медиа только с «браузерным» User-Agent. */
+    private const val UA =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
@@ -24,13 +28,8 @@ object DownloadUtil {
         .followSslRedirects(true)
         .build()
 
-    fun enqueueDownload(
-        context: Context,
-        url: String,
-        title: String,
-        formatLabel: String,
-        extension: String
-    ): Long {
+    /** Имя файла вида X_<пост>_<формат>.<ext>, безопасное для MediaStore. */
+    private fun buildFileName(title: String, formatLabel: String, extension: String): String {
         val sanitizedTitle = sanitizeFilename(title)
         val sanitizedFormat = formatLabel
             .replace('×', 'x')
@@ -39,24 +38,34 @@ object DownloadUtil {
             .replace(Regex("\\s+"), "_")
             .take(35)
             .ifEmpty { "Media" }
-        val ext = if (extension.startsWith(".")) extension else ".$extension"
-        val fileName = "X_${sanitizedTitle}_${sanitizedFormat}$ext"
+        val ext = extension.removePrefix(".")
+        return "X_${sanitizedTitle}_${sanitizedFormat}.$ext"
+    }
+
+    fun enqueueDownload(
+        context: Context,
+        url: String,
+        title: String,
+        formatLabel: String,
+        extension: String
+    ): Long {
+        val fileName = buildFileName(title, formatLabel, extension)
 
         val request = DownloadManager.Request(Uri.parse(url)).apply {
             setTitle("XDownloader: $title")
             setDescription("Скачивание $formatLabel...")
             setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            // Единая папка приложения: Movies/XDownloader, как в YTDownloader
-            setDestinationInExternalPublicDir(
-                Environment.DIRECTORY_MOVIES,
-                "${DownloadStorage.SUBDIR}/$fileName"
-            )
+            // Видео — в Movies/XDownloader, фото — в Pictures/XDownloader:
+            // платформа не пускает изображения в Movies (см. DownloadStorage).
+            val baseDir = if (extension.equals("mp4", true) || extension.equals("webm", true)) {
+                Environment.DIRECTORY_MOVIES
+            } else {
+                Environment.DIRECTORY_PICTURES
+            }
+            setDestinationInExternalPublicDir(baseDir, "${DownloadStorage.SUBDIR}/$fileName")
             setAllowedOverMetered(true)
             setAllowedOverRoaming(true)
-            addRequestHeader(
-                "User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            )
+            addRequestHeader("User-Agent", UA)
             addRequestHeader("Referer", "https://twitter.com/")
         }
 
@@ -144,8 +153,8 @@ object DownloadUtil {
             val isGif = readCount >= 3 && headerBytes[0] == 'G'.code.toByte() && headerBytes[1] == 'I'.code.toByte() && headerBytes[2] == 'F'.code.toByte()
 
             if (isGif) {
-                // X уже отдаёт готовый GIF — конвертировать нечего, просто кладём файл
-                // в общую папку приложения Movies/XDownloader.
+                // X уже отдаёт готовый GIF — конвертировать нечего, просто кладём
+                // файл в папку приложения (GIF уходит в Pictures/XDownloader).
                 val safeTitle = sanitizeFilename(title)
                 val directGifUri = DownloadStorage.save(context, tempVideoFile, "${safeTitle}_anim.gif")
                 withContext(Dispatchers.Main) {

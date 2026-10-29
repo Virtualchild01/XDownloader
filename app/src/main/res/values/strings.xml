@@ -13,7 +13,7 @@
     <string name="btn_close">Закрыть</string>
     <string name="toast_empty_url">Пожалуйста, вставьте ссылку на пост из сети X</string>
     <string name="toast_download_started">Загрузка запущена! Проверьте шторку уведомлений.</string>
-    <string name="toast_gif_saved">Анимированный GIF сохранён в Movies/XDownloader!</string>
+    <string name="toast_gif_saved">Анимированный GIF сохранён в Pictures/XDownloader!</string>
     <string name="toast_error">Ошибка получения данных: %1$s</string>
     <string name="badge_gif">GIF</string>
     <string name="badge_video">ВИДЕО</string>
@@ -36,5 +36,7 @@
     <string name="unit_kb">КБ</string>
     <string name="unit_mb">МБ</string>
     <string name="unit_gb">ГБ</string>
-    <string name="toast_saved_to">Готово! Файл сохранён в Movies/XDownloader</string>
+    <string name="toast_saved_to">Готово! Файл сохранён в папку приложения</string>
+    <string name="gallery_button">Мои загрузки</string>
+    <string name="gallery_empty_hint">Скачайте видео, фото или GIF — файлы появятся здесь</string>
 </resources>

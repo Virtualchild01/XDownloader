@@ -2,7 +2,7 @@ package com.example.xdownloader.data
 
 import android.net.Uri
 
-/** Файл, скачанный приложением и лежащий в Movies/XDownloader. */
+/** Файл, скачанный приложением: видео из Movies/XDownloader, остальное из Pictures/XDownloader. */
 data class DownloadedMedia(
     val uri: Uri,
     val displayName: String,

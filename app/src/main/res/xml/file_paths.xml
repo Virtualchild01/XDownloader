@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Android 7-9 пишут файлы напрямую, поэтому наружу их отдаём через FileProvider -->
+    <external-path
+        name="movies"
+        path="Movies/XDownloader/" />
+    <external-path
+        name="pictures"
+        path="Pictures/XDownloader/" />
+    <external-path
+        name="downloads"
+        path="Download/XDownloader/" />
+</paths>

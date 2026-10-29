@@ -158,6 +158,22 @@
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
+            <!-- Вход в «Мои загрузки»: подпись важнее иконки, иначе кнопку не находят -->
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnGalleryMain"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="match_parent"
+                android:layout_height="52dp"
+                android:layout_marginBottom="16dp"
+                android:text="@string/gallery_title"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                app:backgroundTint="@color/surface_variant_dark"
+                app:cornerRadius="16dp"
+                app:icon="@android:drawable/ic_menu_gallery"
+                app:iconGravity="textStart"
+                app:iconTint="@color/primary" />
+
             <!-- Loading & Analysis Status (Only when fetching post info) -->
             <LinearLayout
                 android:id="@+id/llLoading"

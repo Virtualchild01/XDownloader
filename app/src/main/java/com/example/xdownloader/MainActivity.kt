@@ -203,8 +203,9 @@ class MainActivity : AppCompatActivity() {
             showSupportDialog()
         }
 
-        // «Мои загрузки» в шапке
+        // «Мои загрузки»: иконка в шапке и заметная кнопка под полем ссылки
         binding.btnGallery.setOnClickListener { openGallery() }
+        binding.btnGalleryMain.setOnClickListener { openGallery() }
     }
 
     private fun openGallery() {
