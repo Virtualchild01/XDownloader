@@ -151,9 +151,7 @@ object GifConverter {
             videoFile.setReadable(true, false)
         } catch (ignored: Throwable) {}
 
-        withContext(Dispatchers.Main) {
-            onProgress(35)
-        }
+        onProgress(35)
 
         val safeTitle = targetTitle
             .filter { it.isLetterOrDigit() || it == '_' || it == '-' || it == '.' || it == ' ' }
@@ -199,9 +197,7 @@ object GifConverter {
                             encoder = encoder,
                             diagLog = diagLog
                         ) { p ->
-                            kotlinx.coroutines.runBlocking(Dispatchers.Main) {
-                                onProgress(p)
-                            }
+                            onProgress(p)
                         }
                     } catch (e: Throwable) {
                         diagLog.append("MMR: ").append(e.message ?: e.javaClass.simpleName).append("; ")
@@ -223,9 +219,7 @@ object GifConverter {
                             maxDimension = maxDimension,
                             encoder = encoder
                         ) { p ->
-                            kotlinx.coroutines.runBlocking(Dispatchers.Main) {
-                                onProgress(p)
-                            }
+                            onProgress(p)
                         }
                     } catch (e: Throwable) {
                         diagLog.append("Glide: ").append(e.message ?: e.javaClass.simpleName).append("; ")
@@ -251,9 +245,7 @@ object GifConverter {
                 return@withContext Pair(null, "Не удалось сохранить готовый GIF в Pictures/XDownloader")
             }
 
-            withContext(Dispatchers.Main) {
-                onProgress(100)
-            }
+            onProgress(100)
 
             Pair(savedUri, null)
         } catch (e: Exception) {
@@ -455,14 +447,20 @@ object GifConverter {
             targetWidth = targetWidth,
             encoder = encoder
         ) { p ->
-            // Не дёргаем главный поток на каждый кадр: обновляем раз в 5%
+            // Не дёргаем колбэк на каждый кадр: обновляем раз в 5%.
+            //
+            // Раньше здесь стоял runBlocking(Dispatchers.Main): конвертация шла в
+            // lifecycleScope активити, и колбэк надо было переключить на UI-поток.
+            // Теперь работа живёт в сервисе и не должна зависеть от главного потока
+            // (при свёрнутом приложении он может быть занят) — вызываем напрямую,
+            // а поток выбирает подписчик.
             if (p - lastReported >= 5) {
                 lastReported = p
-                kotlinx.coroutines.runBlocking(Dispatchers.Main) { onProgress(p) }
+                onProgress(p)
             }
         }
         if (frames > 0) {
-            kotlinx.coroutines.runBlocking(Dispatchers.Main) { onProgress(95) }
+            onProgress(95)
         }
         return frames
     }

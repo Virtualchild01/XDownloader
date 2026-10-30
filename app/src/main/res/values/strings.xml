@@ -39,4 +39,11 @@
     <string name="toast_saved_to">Готово! Файл сохранён в папку приложения</string>
     <string name="gallery_button">Мои загрузки</string>
     <string name="gallery_empty_hint">Скачайте видео, фото или GIF — файлы появятся здесь</string>
+
+    <!-- Конвертация GIF в foreground-сервисе: работа идёт и при свёрнутом приложении -->
+    <string name="gif_notification_title">XDownloader</string>
+    <string name="gif_channel_name">Конвертация в GIF</string>
+    <string name="gif_channel_desc">Прогресс создания GIF-анимации</string>
+    <string name="gif_notification_done">GIF сохранён в Pictures/XDownloader</string>
+    <string name="gif_notification_failed">Не удалось создать GIF: %1$s</string>
 </resources>

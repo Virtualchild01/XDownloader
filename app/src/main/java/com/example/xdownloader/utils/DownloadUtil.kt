@@ -90,10 +90,8 @@ object DownloadUtil {
             } catch (ignored: Throwable) {}
         }
         try {
-            withContext(Dispatchers.Main) {
-                onStatusUpdate("Загрузка медиапотока...")
-                onProgress(5)
-            }
+            onStatusUpdate("Загрузка медиапотока...")
+            onProgress(5)
 
             val request = Request.Builder()
                 .url(videoUrl)
@@ -128,9 +126,7 @@ object DownloadUtil {
                                         downloaded += bytesRead
                                         if (totalBytes > 0) {
                                             val downloadPercent = (downloaded * 30 / totalBytes).toInt().coerceIn(5, 30)
-                                            withContext(Dispatchers.Main) {
-                                                onProgress(downloadPercent)
-                                            }
+                                            onProgress(downloadPercent)
                                         }
                                     }
                                     output.flush()
@@ -157,16 +153,12 @@ object DownloadUtil {
                 // файл в папку приложения (GIF уходит в Pictures/XDownloader).
                 val safeTitle = sanitizeFilename(title)
                 val directGifUri = DownloadStorage.save(context, tempVideoFile, "${safeTitle}_anim.gif")
-                withContext(Dispatchers.Main) {
-                    onProgress(100)
-                }
+                onProgress(100)
                 return@withContext Pair(directGifUri, if (directGifUri == null) "Не удалось сохранить GIF в хранилище" else null)
             }
 
-            withContext(Dispatchers.Main) {
-                onStatusUpdate("Конвертация в анимацию GIF...")
-                onProgress(35)
-            }
+            onStatusUpdate("Конвертация в анимацию GIF...")
+            onProgress(35)
 
             val (gifUri, gifErr) = GifConverter.convertVideoToGif(
                 context = context,

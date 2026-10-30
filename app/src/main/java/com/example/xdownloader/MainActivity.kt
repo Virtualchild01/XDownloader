@@ -34,6 +34,7 @@ import com.example.xdownloader.api.XMediaItem
 import com.example.xdownloader.api.XMediaType
 import com.example.xdownloader.api.XPostInfo
 import com.example.xdownloader.databinding.ActivityMainBinding
+import com.example.xdownloader.service.GifConversionService
 import com.example.xdownloader.ui.GalleryActivity
 import com.example.xdownloader.utils.DownloadUtil
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
@@ -57,6 +58,7 @@ class MainActivity : AppCompatActivity() {
     private var lastSavedFileUri: Uri? = null
     private var lastSavedMimeType: String = "image/gif"
     private var downloadMonitorJob: Job? = null
+    private var gifStateJob: Job? = null
 
     companion object {
         private const val PREFS_NAME = "x_downloader_prefs"
@@ -78,6 +80,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Android 13+ требует явного согласия на уведомления. Без него foreground-сервис
+     * всё равно работает, но прогресс в шторке не виден — а он и есть смысл этой
+     * правки. Отказ не блокирует конвертацию: просто уведомлений не будет.
+     */
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* разрешение не обязательно для самой конвертации */ }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         applySavedTheme()
@@ -89,6 +100,22 @@ class MainActivity : AppCompatActivity() {
         setupThemeToggle()
         setupListeners()
         handleIncomingIntent(intent)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // Конвертация живёт в сервисе и переживает сворачивание приложения.
+        // Здесь только показываем её текущее состояние: вернувшись в приложение,
+        // пользователь видит актуальный прогресс, а не пустой экран.
+        gifStateJob = lifecycleScope.launch {
+            GifConversionService.state.collect { state -> renderGifState(state) }
+        }
+    }
+
+    override fun onStop() {
+        gifStateJob?.cancel()
+        gifStateJob = null
+        super.onStop()
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -420,36 +447,17 @@ class MainActivity : AppCompatActivity() {
             val expectedDurationMs = format.durationMs.takeIf { it > 0L }
                 ?: selectedMediaItem?.durationMs ?: 0L
 
-            lifecycleScope.launch {
-                val (uri, errorMsg) = DownloadUtil.downloadAndConvertToGif(
-                    context = this@MainActivity,
-                    videoUrl = format.downloadUrl,
-                    title = title,
-                    expectedDurationMs = expectedDurationMs,
-                    maxDimension = format.targetGifMaxDim,
-                    onStatusUpdate = { status ->
-                        binding.tvStatus.text = status
-                    },
-                    onProgress = { progress ->
-                        binding.progressDownload.progress = progress
-                        binding.tvStatus.text = "Создание GIF: $progress%"
-                    }
-                )
+            requestNotificationPermissionIfNeeded()
 
-                binding.btnDownload.isEnabled = true
-                binding.progressDownload.visibility = View.GONE
-
-                if (uri != null) {
-                    lastSavedFileUri = uri
-                    lastSavedMimeType = "image/gif"
-                    binding.tvStatus.text = getString(R.string.toast_saved_to)
-                    Toast.makeText(this@MainActivity, getString(R.string.toast_gif_saved), Toast.LENGTH_LONG).show()
-                } else {
-                    val err = errorMsg ?: "Не удалось создать GIF"
-                    binding.tvStatus.text = "Ошибка: $err"
-                    Toast.makeText(this@MainActivity, "Ошибка: $err", Toast.LENGTH_LONG).show()
-                }
-            }
+            // Работа уходит в foreground-сервис: в lifecycleScope активити она
+            // замирала при сворачивании (Android 11+ замораживает фон).
+            GifConversionService.start(
+                context = this,
+                url = format.downloadUrl,
+                title = title,
+                durationMs = expectedDurationMs,
+                maxDim = format.targetGifMaxDim
+            )
         } else {
             binding.progressDownload.isIndeterminate = true
             binding.tvStatus.text = "Скачивание файла..."
@@ -471,6 +479,52 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, getString(R.string.toast_download_started), Toast.LENGTH_SHORT).show()
             trackDownloadProgress(downloadId, mimeType)
         }
+    }
+
+    /** Android 13+ спрашивает разрешение на уведомления; без него не виден прогресс. */
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val granted = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    /**
+     * Показывает состояние конвертации GIF, пришедшее из сервиса.
+     *
+     * Вызывается и при возврате в приложение: если конвертация шла в фоне,
+     * экран сразу покажет актуальный процент, а не пустоту.
+     */
+    private fun renderGifState(state: GifConversionService.State) {
+        if (state.running) {
+            binding.layoutStatus.visibility = View.VISIBLE
+            binding.progressDownload.visibility = View.VISIBLE
+            binding.progressDownload.isIndeterminate = false
+            binding.progressDownload.progress = state.progress
+            binding.btnDownload.isEnabled = false
+            binding.tvStatus.text = state.status.ifEmpty { "Создание GIF: ${state.progress}%" }
+            return
+        }
+
+        val uri = state.resultUri
+        val error = state.error
+        if (uri == null && error == null) return
+
+        binding.btnDownload.isEnabled = true
+        binding.progressDownload.visibility = View.GONE
+
+        if (uri != null) {
+            lastSavedFileUri = uri
+            lastSavedMimeType = "image/gif"
+            binding.tvStatus.text = getString(R.string.toast_saved_to)
+        } else {
+            binding.tvStatus.text = "Ошибка: $error"
+        }
+        // Результат показан — забываем, чтобы он не всплыл снова при следующем onStart
+        GifConversionService.clearResult()
     }
 
     /**

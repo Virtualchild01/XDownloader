@@ -12,6 +12,10 @@
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Конвертация GIF идёт в foreground-сервисе: без этого Android 11+
+         замораживает фон и работа встаёт, пока приложение свёрнуто. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
     <application
         android:allowBackup="true"
@@ -48,6 +52,12 @@
             android:name=".ui.GalleryActivity"
             android:exported="false"
             android:label="@string/gallery_title" />
+
+        <!-- Конвертация GIF переживает сворачивание приложения -->
+        <service
+            android:name=".service.GifConversionService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <!-- Android 7-9 хранят файлы как file://, наружу такой путь отдавать нельзя -->
         <provider
