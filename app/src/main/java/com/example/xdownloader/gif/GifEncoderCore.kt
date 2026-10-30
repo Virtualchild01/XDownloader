@@ -70,14 +70,6 @@ object GifEncoderCore {
         }
         if (meta.videoFrames <= 0) return 0
 
-        // Палитра — по кадрам, разнесённым по всему ролику, а не по первому кадру.
-        if (!encoder.isPaletteBuilt()) {
-            if (samplePalette(videoFile, meta.videoFrames, targetWidth, encoder)) {
-                encoder.finalizePalette()
-            }
-        }
-        encoder.setRepeat(0)
-
         val clipDurationMs = min(fullDurationMs, maxDurationSec * 1000L).coerceAtLeast(200L)
         val sourceFps = (meta.videoFrames * 1000.0) / fullDurationMs
 
@@ -94,6 +86,18 @@ object GifEncoderCore {
             1
         }
         val totalFramesToEncode = ((framesInClip + step - 1) / step).coerceAtLeast(1)
+
+        // Палитра — по кадрам, разнесённым по КЛИПУ, а не по всему ролику: кадры за
+        // пределами первых maxDurationSec в GIF не попадают, и их цвета только
+        // разбавляли палитру. Плюс прогресс палитры теперь виден, а не «замирает» на 35%.
+        if (!encoder.isPaletteBuilt()) {
+            if (samplePalette(videoFile, framesInClip, targetWidth, encoder) { p ->
+                onProgress((35 + p * 10 / 100).coerceIn(35, 45))
+            }) {
+                encoder.finalizePalette()
+            }
+        }
+        encoder.setRepeat(0)
 
         // Задержка по номеру кадра, а не по числу уже записанных: если кадр потерялся,
         // суммарная длительность не «уплывает».
@@ -155,7 +159,7 @@ object GifEncoderCore {
                         if (encoder.writeQuantizedFrame(entry.value)) encodedCount++
                         framePool.addLast(entry.value)
                         nextGifOrderToEmit = entry.key + 1
-                        onProgress((35 + (encodedCount * 60 / totalFramesToEncode)).coerceIn(35, 95))
+                        onProgress((45 + (encodedCount * 50 / totalFramesToEncode)).coerceIn(45, 95))
                     } else {
                         break
                     }
@@ -170,7 +174,7 @@ object GifEncoderCore {
                 encoder.setDelay(delayCsFor(encodedCount) * 10)
                 if (encoder.writeQuantizedFrame(entry.value)) encodedCount++
                 framePool.addLast(entry.value)
-                onProgress((35 + (encodedCount * 60 / totalFramesToEncode)).coerceIn(35, 95))
+                onProgress((45 + (encodedCount * 50 / totalFramesToEncode)).coerceIn(45, 95))
             }
 
             framePool.clear()
@@ -185,42 +189,90 @@ object GifEncoderCore {
     /**
      * Собирает цвета нескольких кадров, равномерно разнесённых по ролику.
      *
+     * Способ чтения выбирается по стоимости. Точный seek в jcodec декодирует все
+     * кадры от предыдущего ключевого, поэтому на длинном GOP (один I-кадр на весь
+     * клип) 12 seek'ов по 12-секундному ролику стоят дороже, чем один честный
+     * проход по клипу: замер на 720p/30fps/12с дал 16.6 с против 4.6 с. На частом
+     * GOP (кадр в секунду) seek дешевле — 0.46 с против 5.8 с. Поэтому здесь
+     * считается оценка по метаданным ключевых кадров, а не выбирается жёстко.
+     *
+     * @param onProgress 0..100 по числу собранных образцов
      * @return true, если палитра набрала хотя бы один кадр
      */
     fun samplePalette(
         videoFile: File,
         totalFrames: Int,
         targetShortSide: Int,
-        encoder: AnimatedGifEncoder
+        encoder: AnimatedGifEncoder,
+        onProgress: (Int) -> Unit = {}
     ): Boolean {
+        if (totalFrames <= 0) return false
+
+        val wanted = SAMPLE_FRAME_COUNT.coerceAtMost(totalFrames).coerceAtLeast(1)
+        val picks = (0 until wanted)
+            .map { (it.toLong() * totalFrames / wanted).toInt() }
+            .distinct()
+
+        val keyFrames = readKeyFrames(videoFile)
+        val seekCost = picks.sumOf { p -> p - prevKeyFrameAt(p, keyFrames) + 1 }
+        val useSequential = seekCost > totalFrames
+
         var channel: SeekableByteChannel? = null
         var reusableRgbPic: Picture? = null
         var sampled = 0
 
-        try {
-            val wanted = SAMPLE_FRAME_COUNT.coerceAtMost(totalFrames).coerceAtLeast(1)
-            val picks = (0 until wanted)
-                .map { (it.toLong() * totalFrames / wanted).toInt() }
-                .distinct()
+        // Возвращает true, если кадр добавлен в гистограмму. RGB-буфер переиспользуется.
+        fun accumulate(pic: Picture): Boolean = try {
+            val rgbPic = convertPictureToRgb(pic, reusableRgbPic)
+            if (rgbPic != null) {
+                if (rgbPic !== pic) reusableRgbPic = rgbPic
+                val g = computeGeometry(pic, rgbPic, targetShortSide)
+                encoder.accumulateJCodecRgb(
+                    rgbPic.data[0], rgbPic.width, rgbPic.height,
+                    g.cropX, g.cropY, g.cropW, g.cropH, g.outW, g.outH
+                )
+                true
+            } else {
+                false
+            }
+        } catch (ignored: Throwable) {
+            false
+        }
 
+        try {
             channel = NIOUtils.readableChannel(videoFile)
             var grab: FrameGrab = FrameGrab.createFrameGrab(channel)
 
-            for (frameIdx in picks) {
-                if (!encoder.canAddPaletteSample()) break
-                try {
-                    grab = grab.seekToFramePrecise(frameIdx)
-                    val pic = grab.nativeFrame ?: continue
-                    val rgbPic = convertPictureToRgb(pic, reusableRgbPic) ?: continue
-                    if (rgbPic !== pic) reusableRgbPic = rgbPic
-                    val g = computeGeometry(pic, rgbPic, targetShortSide)
-                    encoder.accumulateJCodecRgb(
-                        rgbPic.data[0], rgbPic.width, rgbPic.height,
-                        g.cropX, g.cropY, g.cropW, g.cropH, g.outW, g.outH
-                    )
-                    sampled++
-                } catch (ignored: Throwable) {
-                    // Один неудачный seek не должен обнулять уже собранную палитру
+            if (useSequential) {
+                // Один проход: seek не нужен, кадры идут подряд.
+                var frameIdx = 0
+                var pickIdx = 0
+                val lastPick = picks.last()
+                while (pickIdx < picks.size && encoder.canAddPaletteSample()) {
+                    val pic = try { grab.nativeFrame } catch (e: Throwable) { null } ?: break
+                    if (frameIdx == picks[pickIdx]) {
+                        if (accumulate(pic)) {
+                            sampled++
+                            onProgress(sampled * 100 / picks.size)
+                        }
+                        pickIdx++
+                    }
+                    frameIdx++
+                    if (frameIdx > lastPick) break
+                }
+            } else {
+                for (frameIdx in picks) {
+                    if (!encoder.canAddPaletteSample()) break
+                    try {
+                        grab = grab.seekToFramePrecise(frameIdx)
+                        val pic = grab.nativeFrame ?: continue
+                        if (accumulate(pic)) {
+                            sampled++
+                            onProgress(sampled * 100 / picks.size)
+                        }
+                    } catch (ignored: Throwable) {
+                        // Один неудачный seek не должен обнулять уже собранную палитру
+                    }
                 }
             }
         } catch (ignored: Throwable) {
@@ -229,6 +281,32 @@ object GifEncoderCore {
             try { NIOUtils.closeQuietly(channel) } catch (ignored: Throwable) {}
         }
         return sampled > 0
+    }
+
+    /**
+     * Индексы ключевых кадров из метаданных трека (jcodec отдаёт их нулевыми).
+     * `null` — метаданных нет, считаем, что seek стоит одного кадра.
+     */
+    private fun readKeyFrames(videoFile: File): IntArray? {
+        var channel: SeekableByteChannel? = null
+        return try {
+            channel = NIOUtils.readableChannel(videoFile)
+            FrameGrab.createFrameGrab(channel).videoTrack.meta.seekFrames
+        } catch (ignored: Throwable) {
+            null
+        } finally {
+            try { NIOUtils.closeQuietly(channel) } catch (ignored: Throwable) {}
+        }
+    }
+
+    /** Ближайший ключевой кадр не позже [frameIdx]. */
+    private fun prevKeyFrameAt(frameIdx: Int, keyFrames: IntArray?): Int {
+        if (keyFrames == null || keyFrames.isEmpty()) return frameIdx
+        var prev = keyFrames[0]
+        for (k in keyFrames) {
+            if (k <= frameIdx) prev = k else break
+        }
+        return prev
     }
 
     /**
