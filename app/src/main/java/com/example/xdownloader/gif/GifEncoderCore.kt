@@ -37,7 +37,7 @@ object GifEncoderCore {
     const val SAMPLE_FRAME_COUNT = 12
 
     /** Кроп и масштаб кадра: что вырезать из исходника и какого размера писать в GIF. */
-    private data class Geometry(
+    internal data class Geometry(
         val cropX: Int,
         val cropY: Int,
         val cropW: Int,
@@ -312,8 +312,11 @@ object GifEncoderCore {
     /**
      * Кроп по метаданным кадра и масштаб под [targetShortSide].
      * Общий для палитры и кадров: если размеры разойдутся, гистограмма не совпадёт с кадром.
+     *
+     * internal (а не private) ради теста: ограничение длинной стороны 1280 —
+     * это то, что легко потерять незаметно, а цена потери — неиграбельный GIF.
      */
-    private fun computeGeometry(src: Picture, rgbPic: Picture, targetShortSide: Int): Geometry {
+    internal fun computeGeometry(src: Picture, rgbPic: Picture, targetShortSide: Int): Geometry {
         val w = rgbPic.width
         val h = rgbPic.height
         var cropX = 0
@@ -339,8 +342,17 @@ object GifEncoderCore {
 
         val minSide = min(cropW, cropH)
         val maxSide = max(cropW, cropH)
-        val scale = if (targetShortSide > 0 && (minSide > targetShortSide || maxSide > 1280)) {
-            min(targetShortSide.toFloat() / minSide.toFloat(), 1280f / maxSide.toFloat()).coerceAtMost(1.0f)
+        // [targetShortSide] — желаемая короткая сторона (0 = «как есть»), но длинная
+        // сторона ВСЕГДА ограничена 1280: GIF выше этого телефон не проигрывает
+        // плавно. Замер полного декода на десктопе (телефон примерно втрое медленнее):
+        //   1280x720  -> 9.0x запаса реального времени, 19 МБ
+        //   1920x1080 -> 5.8x, 18 МБ за 6 с
+        //   3840x2160 -> 1.5x, 31 МБ за 3 с  (не проигрывается)
+        // Раньше ограничение 1280 действовало только вместе с targetShortSide > 0,
+        // поэтому «GIF (Оригинал)» с 4K-ролика давал 3840x2160 на 31 МБ.
+        val scale = if (maxSide > 1280 || (targetShortSide > 0 && minSide > targetShortSide)) {
+            val byShort = if (targetShortSide > 0) targetShortSide.toFloat() / minSide.toFloat() else 1.0f
+            min(byShort, 1280f / maxSide.toFloat()).coerceAtMost(1.0f)
         } else {
             1.0f
         }

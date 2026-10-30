@@ -6,7 +6,7 @@ plugins {
 // versionCode только растёт: иначе Android откажется ставить обновление поверх.
 // CI передаёт -PversionCode=${{ github.run_number }}, а он у каждого workflow свой
 // и начинается с 1 — без этого пола CI выпускал APK, который не вставал поверх 1.0.26.
-val minVersionCode = 30
+val minVersionCode = 31
 val declaredVersionCode = (project.findProperty("versionCode") as? String)?.toIntOrNull() ?: 0
 val appVersionCode = maxOf(declaredVersionCode, minVersionCode)
 
