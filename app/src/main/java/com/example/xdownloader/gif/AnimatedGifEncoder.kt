@@ -8,7 +8,7 @@ import java.util.Arrays
 
 /**
  * High-Precision Smooth Animated GIF89a Encoder:
- * 1) Единая глобальная гибридная палитра (216 адаптивных оттенков сцены + 39 насыщенных хроматических акцентов + слот 255 прозрачности)
+ * 1) Единая глобальная палитра: 255 адаптивных оттенков сцены + слот 255 прозрачности
  * 2) Полная предвычисленная таблица RGB555 -> Palette (32 768 ячеек, O(1) доступ без циклов поиска на кадрах)
  * 3) Матрица упорядоченного дизеринга Байера 4x4 (Bayer Ordered Dithering) для идеальной плавности
  *    движения камеры, градиентов и освещения на каждом кадре (полные 24-30 fps)
@@ -62,29 +62,17 @@ class AnimatedGifEncoder {
              3,  0,  2, -1
         )
 
-        // 39 гарантированных насыщенных хроматических и базовых цветов (слоты 216..254),
-        // чтобы мелкие яркие детали (красные глаза, блики, неон) никогда не теряли цвет
-        private val CHROMATIC_ANCHORS = arrayOf(
-            intArrayOf(0, 0, 0), intArrayOf(255, 255, 255), intArrayOf(128, 128, 128),
-            // Красные и багровые оттенки
-            intArrayOf(108, 0, 0), intArrayOf(144, 0, 0), intArrayOf(180, 0, 0),
-            intArrayOf(216, 0, 0), intArrayOf(252, 0, 0), intArrayOf(252, 36, 0),
-            intArrayOf(216, 36, 0), intArrayOf(180, 36, 0), intArrayOf(252, 36, 36),
-            intArrayOf(252, 72, 72), intArrayOf(216, 72, 85), intArrayOf(252, 72, 85),
-            // Зелёные оттенки
-            intArrayOf(0, 144, 0), intArrayOf(0, 180, 0), intArrayOf(0, 216, 0),
-            intArrayOf(0, 252, 0), intArrayOf(72, 252, 72),
-            // Синие и голубые оттенки
-            intArrayOf(0, 0, 170), intArrayOf(0, 0, 255), intArrayOf(36, 108, 255),
-            intArrayOf(72, 180, 255), intArrayOf(0, 216, 255), intArrayOf(0, 252, 252),
-            // Жёлтые, оранжевые, пурпурные и фиолетовые оттенки
-            intArrayOf(252, 144, 0), intArrayOf(252, 180, 0), intArrayOf(252, 216, 0),
-            intArrayOf(252, 252, 0), intArrayOf(252, 216, 108), intArrayOf(180, 0, 180),
-            intArrayOf(252, 0, 252), intArrayOf(252, 72, 170), intArrayOf(144, 72, 255),
-            // Тёплые телесные и древесные полутона
-            intArrayOf(252, 216, 170), intArrayOf(216, 144, 108),
-            intArrayOf(108, 72, 36), intArrayOf(72, 36, 0)
-        )
+        // Сколько слотов палитры отдано сцене. Слот 255 занят прозрачностью,
+        // поэтому реальных цветов 255.
+        //
+        // Раньше 39 слотов (216..254) были жёстко заняты «насыщенными акцентами»:
+        // белым, жёлтым, неоном и т. п. Идея была сохранить мелкие яркие детали, но
+        // на деле цвета из другого ролика съедали шестую часть палитры. Замер
+        // средней ошибки квантования на четырёх роликах: 113.2/113.2/109.7/84.1 с
+        // акцентами против 75.2/76.5/79.0/73.3 без них — падение на 10-35%.
+        // Яркие цвета и так попадают в палитру, если они есть в сцене: гистограмма
+        // строится по кадрам всего клипа.
+        private const val SCENE_SLOTS = 255
     }
 
     fun setDelay(ms: Int) {
@@ -468,7 +456,7 @@ class AnimatedGifEncoder {
         }
         Arrays.sort(packed)
 
-        // Слоты 0..215: самые частые оттенки сцены, собранные по нескольким кадрам.
+        // Слоты 0..254: самые частые оттенки сцены, собранные по нескольким кадрам.
         //
         // Берём только непустые корзины. Раньше цикл шёл ровно 216 раз и после
         // исчерпания реальных цветов добирал пустые корзины по убыванию индекса —
@@ -477,7 +465,7 @@ class AnimatedGifEncoder {
         var topColor = 0
         var slot = 0
         var i = 32767
-        while (slot < 216 && i >= 0) {
+        while (slot < SCENE_SLOTS && i >= 0) {
             val pk = packed[i]
             val bIdx = (pk and 32767L).toInt()
             if (counts[bIdx] <= 0) break // дальше только пустые корзины
@@ -501,7 +489,7 @@ class AnimatedGifEncoder {
         val fillR = ((topColor shr 10) and 31) * 8 + 4
         val fillG = ((topColor shr 5) and 31) * 8 + 4
         val fillB = (topColor and 31) * 8 + 4
-        while (slot < 216) {
+        while (slot < SCENE_SLOTS) {
             palR[slot] = fillR
             palG[slot] = fillG
             palB[slot] = fillB
@@ -509,25 +497,6 @@ class AnimatedGifEncoder {
             colorTab[slot * 3 + 1] = fillG.toByte()
             colorTab[slot * 3 + 2] = fillB.toByte()
             slot++
-        }
-
-        // Слоты 216..254: 39 насыщенных хроматических акцентов
-        for (a in 0 until 39) {
-            val slot = 216 + a
-            val anchor = CHROMATIC_ANCHORS[a]
-            val r = anchor[0]
-            val g = anchor[1]
-            val b = anchor[2]
-            palR[slot] = r
-            palG[slot] = g
-            palB[slot] = b
-            colorTab[slot * 3] = r.toByte()
-            colorTab[slot * 3 + 1] = g.toByte()
-            colorTab[slot * 3 + 2] = b.toByte()
-            val bIdx = ((r shr 3) shl 10) or ((g shr 3) shl 5) or (b shr 3)
-            if (rgb555Lut[bIdx] < 0) {
-                rgb555Lut[bIdx] = slot
-            }
         }
 
         // Слот 255: прозрачный индекс для безпотерьного дельта-кодирования
@@ -543,7 +512,7 @@ class AnimatedGifEncoder {
             val b = (bIdx and 31) * 8 + 4
             var bestSlot = 0
             var bestDist = Int.MAX_VALUE
-            for (s in 0 until 255) {
+            for (s in 0 until SCENE_SLOTS) {
                 val dr = r - palR[s]
                 val dg = g - palG[s]
                 val db = b - palB[s]

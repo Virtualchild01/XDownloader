@@ -1,5 +1,6 @@
 package com.example.xdownloader.ui
 
+import android.content.Context
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.view.LayoutInflater
@@ -41,8 +42,17 @@ class GalleryAdapter(
             b.tvBadge.visibility = View.VISIBLE
             b.tvBadge.text = item.extensionLabel.uppercase(Locale.US)
 
+            // dontAnimate(): без него Glide запускает анимацию КАЖДОГО GIF в сетке.
+            // Кадры декодируются по одному (LZW + подмена Bitmap), и на один
+            // 12-секундный GIF это 360 декодирований: сетка фризит при прокрутке,
+            // а вход в галерею подвисает. Превью анимированным быть не должно —
+            // анимация остаётся при открытии файла.
+            //
+            // override(): декодируем сразу под размер ячейки, а не в 1280x720.
             Glide.with(b.ivThumb)
                 .load(item.uri)
+                .dontAnimate()
+                .override(thumbSize(context))
                 .centerCrop()
                 .placeholder(ColorDrawable(Color.DKGRAY))
                 .error(ColorDrawable(Color.DKGRAY))
@@ -50,6 +60,12 @@ class GalleryAdapter(
 
             b.root.setOnClickListener { onOpen(item) }
             b.btnMore.setOnClickListener { onMore(item) }
+        }
+
+        /** Размер превью в пикселях: высота ячейки 110dp плюс запас под centerCrop. */
+        private fun thumbSize(context: Context): Int {
+            val dp = context.resources.displayMetrics.density
+            return (140 * dp).toInt().coerceAtLeast(1)
         }
 
         /** Размер как в системном проводнике: КБ до мегабайта, дальше МБ/ГБ. */
